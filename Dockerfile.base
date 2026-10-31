@@ -1,0 +1,133 @@
+# Reusable base image for the test-runner containers: XFCE desktop + xrdp
+# (with an RDP self-login "primer" so the desktop session, and the
+# testrunner it autostarts, exist before a human ever connects), pipewire/
+# pulseaudio wired for RDP audio, sshd, a Python venv for the testrunner
+# app, and the generic screen-scraping toolkit (tesseract/xdotool/
+# imagemagick/mtools/genisoimage) that pyhelpers uses across every emulator
+# backend regardless of which one is present.
+#
+# Nothing backend- or toolchain-specific lives here (no QEMU/86Box/PCSX2/
+# xemu/Basilisk II, no Retro68/OpenWatcom/PS2SDK/nxdk cross-compilers). Those
+# live in the child image (see Dockerfile), which does `FROM` this image so
+# every backend image shares this layer instead of re-installing/rebuilding
+# it from scratch.
+#
+# Build:   docker buildx bake base   (or: docker build -f Dockerfile.base -t xp5-rdp-testbase:latest .)
+# Components + final image: see Dockerfile / docker-bake.hcl.
+FROM ubuntu:25.04
+ENV TZ=UTC
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# Point apt at an internal caching proxy/mirror (e.g. apt-cacher-ng) instead
+# of the public Ubuntu archive, e.g. --build-arg APT_PROXY=http://host:3142
+ARG APT_PROXY=
+RUN [ -z "$APT_PROXY" ] || printf '%s\n' \
+        "Acquire::http::Proxy \"$APT_PROXY\";" \
+        'Acquire::http::Pipeline-Depth "0";' \
+        > /etc/apt/apt.conf.d/01proxy
+# Pipeline-Depth 0 above disables apt's HTTP request pipelining, which
+# apt-cacher-ng (and many other caching proxies) does not handle reliably --
+# pipelined responses can get interleaved, corrupting the fetched file. That
+# corruption then gets cached, so *every* client behind the proxy keeps
+# getting served the same broken file until it's manually purged. Symptom:
+# "E: Failed to fetch .../InRelease  Clearsigned file isn't valid, got
+# 'NOSPLIT'". Disabling pipelining avoids the corruption at the source
+# instead of working around it by repeatedly clearing the cache.
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        xfce4 \
+        xfce4-clipman-plugin \
+        xfce4-cpugraph-plugin \
+        xfce4-netload-plugin \
+        xserver-xorg-legacy \
+        xdg-utils \
+        dbus-x11 \
+        xfce4-screenshooter \
+        xfce4-taskmanager \
+        xfce4-terminal \
+        xfce4-xkb-plugin \
+        xorgxrdp \
+        xrdp \
+        freerdp3-x11 \
+        xvfb \
+        openssh-server \
+        sudo \
+        wget \
+        curl \
+        bzip2 \
+        python3 \
+        python3-pip \
+        python3-venv \
+        xterm \
+        git \
+        vim \
+        # generic screen-scraping/disk-image toolkit shared by every backend
+        # via pyhelpers/dispatch_functions.py + pyhelpers/mediahelpers.py
+        genisoimage \
+        tesseract-ocr \
+        mtools \
+        xdotool \
+        imagemagick \
+        # for pipewire (RDP audio channel)
+        pipewire \
+        pipewire-pulse wireplumber \
+        pipewire-audio-client-libraries \
+        dbus-user-session alsa-utils \
+        pipewire-module-xrdp \
+        pulseaudio-utils \
+        # build deps for pipewire-module-xrdp, built from source below
+        build-essential \
+        autoconf \
+        automake \
+        libtool \
+        pkg-config \
+        libpipewire-0.3-dev \
+        libspa-0.2-dev
+RUN apt-get remove -y light-locker xscreensaver
+RUN apt-get autoremove -y
+RUN rm -rf /var/cache/apt /var/lib/apt/lists/*
+
+# get the good tesseract ocr data
+RUN mkdir -p /usr/local/share/tessdata && \
+    curl -sL -o /usr/local/share/tessdata/eng.traineddata \
+        https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata
+
+# Fix XRDP/X11 setup
+RUN mkdir -p /var/run/dbus && \
+    cp /etc/X11/xrdp/xorg.conf /etc/X11 || true && \
+    sed -i "s/console/anybody/g" /etc/X11/Xwrapper.config && \
+    sed -i "s|xrdp/xorg|xorg|g" /etc/xrdp/sesman.ini && \
+    echo "xfce4-session" >> /etc/skel/.Xsession
+
+ENV VENV_PATH=/opt/venv
+ENV PATH="$VENV_PATH/bin:$PATH"
+
+# create venv
+WORKDIR /app
+COPY requirements.txt /app/
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip && \
+    /opt/venv/bin/pip install -r /app/requirements.txt && \
+    chgrp -R users /opt/venv && \
+    chmod -R g+rwX /opt/venv && \
+    find /opt/venv -type d -exec chmod g+s {} \;
+
+# build the pipewire module for xrdp audio
+WORKDIR /tmp
+RUN mkdir -p /app/pipewire-module && \
+    git clone https://github.com/neutrinolabs/pipewire-module-xrdp.git /tmp/pipewire-module && \
+    cd /tmp/pipewire-module && \
+    ./bootstrap && \
+    ./configure --with-module-dir=/usr/lib/x86_64-linux-gnu/pipewire-0.3 && \
+    make -j4 && \
+    make install && \
+    ldconfig
+
+COPY startaudio.sh /app/
+RUN chmod +x /app/startaudio.sh
+COPY entrypoint.sh /app
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 3389 8080 22
+ENTRYPOINT ["/app/entrypoint.sh"]

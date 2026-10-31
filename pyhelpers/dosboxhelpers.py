@@ -4,8 +4,14 @@ import sys
 import time
 import threading
 
+from PIL import Image
+
 from displayhelpers import resolve_display
+import windowlayout
 from qemuhelpers import TESSERACT_TESSDATA_ARGS
+
+# read_screen() upscale factor before tesseract; matches "ocr_scale" in qemuhelpers.ocr_word_find
+OCR_SCALE = 4
 
 HELPERDIR = os.path.dirname(os.path.abspath(__file__))
 if HELPERDIR not in sys.path:
@@ -20,23 +26,16 @@ except ImportError:
         register = staticmethod(lambda *a, **k: None)
         unregister = staticmethod(lambda *a, **k: None)
 
-TESTSRC_BASEDIR = "/testsrc"
+TESTSRC_BASEDIR = os.environ.get("TESTSRC_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DOSBOX_BIN = "dosbox-x"
 
-# -nomenu matters for screenshots: without it dosbox-x draws a 17px menu bar on
-# top of the emulated screen
+# -nomenu: keep the 17px menu bar out of screenshots
 WINDOW_ARGS = ["-fastlaunch", "-nogui", "-nomenu"]
 
 
 def run_headless(config_path, timeout=120, extra_args=None):
-    """Run a config to completion with no X at all (-silent runs [autoexec] then exits).
-
-    Blind: -silent creates no window, so there is nothing for `import` to
-    capture and nothing for xdotool to send keys to. 
-
-    Returns (ok, log). 
-    """
+    """Run a config to completion with no X (-silent runs [autoexec] then exits; blind: no window to capture or send keys to) -> (ok, log)."""
     args = [DOSBOX_BIN, "-conf", config_path, "-silent", "-fastlaunch"]
     if extra_args:
         args += extra_args
@@ -59,17 +58,11 @@ def run_headless(config_path, timeout=120, extra_args=None):
     return True, log
 
 
-
 class DosboxInstance:
-    """A windowed dosbox-x, driven by xdotool and screenshotted with `import`.
+    """Windowed dosbox-x driven by xdotool, screenshotted with `import`. The window opens on the runner's X session; display="auto" gives a private Xvfb."""
 
-    Use this for anything you need to observe. By default the window opens on
-    the runner's own X session 
-
-    `display="auto"` instead gives the instance a private Xvfb
-    """
-
-    def __init__(self, name, config_path=None, display=None):
+    def __init__(self, name, config_path=None, display=None, window_slot=None,
+                 screenshot_scale=None):
         self.name = name
         self.process = None
         self.pid = None
@@ -77,9 +70,15 @@ class DosboxInstance:
         self.screenshot_count = 0
         self.config_path = config_path
         self.xvfb = None
-        # "auto" is resolved to a private Xvfb in start(); anything else lands
-        # on the runner's visible xfce/RDP session.
+        # screenshot scale; defaults to OCR_SCALE
+        try:
+            self.screenshot_scale = float(screenshot_scale) if screenshot_scale not in (None, "") else float(OCR_SCALE)
+        except (TypeError, ValueError):
+            self.screenshot_scale = float(OCR_SCALE)
+        # display: "auto" -> private Xvfb in start(); else the runner's xfce/RDP session
         self.display = display if display == "auto" else resolve_display(display)
+        # tile slot (dispatch_functions._next_window_slot / windowlayout.tile_position)
+        self.window_slot = window_slot
 
 
     def _env(self):
@@ -89,7 +88,7 @@ class DosboxInstance:
 
 
     def _start_xvfb(self):
-        # Pick a display number nothing has claimed a socket for.
+        # free display number
         for num in range(90, 120):
             if os.path.exists(f"/tmp/.X11-unix/X{num}"):
                 continue
@@ -147,7 +146,7 @@ class DosboxInstance:
                 self.stdout_lines.append(line.strip())
 
     def get_window_id(self):
-        # Finds the window ID specifically belonging to this instance's PID
+        # window id for this instance's PID
         try:
             cmd = ['xdotool', 'search', '--pid', str(self.pid), '--onlyvisible', '--class', 'dosbox']
             result = subprocess.run(cmd, capture_output=True, text=True, env=self._env(), timeout=5)
@@ -157,32 +156,34 @@ class DosboxInstance:
             pass
         return None
 
+    def _move_to_tile(self, wid):
+        """Snap the window onto its round-robin tile slot (clamped to the session edge)."""
+        win_size = windowlayout.window_geometry(wid, self.display)
+        x, y = windowlayout.tile_position(self.window_slot, win_size, self.display)
+        try:
+            subprocess.run(['xdotool', 'windowmove', wid, str(x), str(y)],
+                           capture_output=True, env=self._env(), timeout=5)
+        except Exception as e:
+            print(f"WARNING: {self.name} failed to move window {wid} to ({x},{y}): {e}")
+
     def wait_for_ready(self, timeout=5):
         start = time.time()
         while time.time() - start < timeout:
             if self.process.poll() is not None: return False
-            if self.get_window_id():
+            wid = self.get_window_id()
+            if wid:
                 time.sleep(0.5)
+                self._move_to_tile(wid)
                 return True
             time.sleep(0.5)
         return False
 
     def is_alive(self):
-        """False once the emulator process has exited.
-
-        Calling poll() is also what reaps it: without this the exited child
-        stays a zombie, so /proc keeps its pid and anything scanning for a
-        running dosbox-x (liveview) still sees one.
-        """
+        """False once the process has exited; poll() also reaps it so liveview doesn't see a zombie."""
         return self.process is not None and self.process.poll() is None
 
     def _sleep_while_alive(self, seconds, deadline=None):
-        """Sleep up to `seconds`, waking early if the process exits.
-
-        Liveness is checked once a second regardless of how long the caller
-        wants to wait, so a long OCR poll interval can't delay noticing that
-        the user closed the window. Returns False if it exited.
-        """
+        """Sleep up to `seconds`, waking early if the process exits (checked each second) -> False if it exited."""
         end = time.time() + seconds
         if deadline is not None:
             end = min(end, deadline)
@@ -193,14 +194,7 @@ class DosboxInstance:
         return self.is_alive()
 
     def wait_for_screen(self, expect, timeout=60, poll=2.0):
-        """Poll OCR until `expect` (case-insensitive) appears on screen.
-
-        Returns (ok, last_ocr_text). 
-
-        exits up early if the emulator exits (the user closed the window):
-        there is nothing left to OCR, so waiting out the full timeout would
-        just leave the run looking active with no VM behind it.
-        """
+        """Poll OCR until `expect` (case-insensitive) appears -> (ok, last_ocr_text). Ends early if the emulator exits."""
         needle = expect.lower()
         deadline = time.time() + timeout
         text = ""
@@ -215,17 +209,13 @@ class DosboxInstance:
         return False, text
 
     def send_command(self, cmd_text, special_keys=None, key_delay=12):
-        # dosbox-x is SDL2, which drops key events for any window it doesn't
-        # consider focused -- so `xdotool type --window <wid>` silently goes
-        # nowhere unless that window already has focus.
+        # SDL2 drops key events unless the window has focus
         wid = self.get_window_id()
         if not wid:
             return False
 
         env = self._env()
         try:
-            # --sync waits for a WM confirmation event that never arrives if
-            # the window is closed/destroyed mid-call 
             subprocess.run(['xdotool', 'windowactivate', '--sync', wid],
                            capture_output=True, env=env, timeout=5)
             subprocess.run(['xdotool', 'windowfocus', '--sync', wid],
@@ -245,8 +235,14 @@ class DosboxInstance:
 
         try:
             if cmd_text:
-                subprocess.run(['xdotool', 'type', '--delay', str(key_delay), cmd_text],
-                               env=env, timeout=30)
+                # xdotool type does not send "\n" as Enter: split cmd_text per line
+                lines = str(cmd_text).split("\n")
+                for i, line in enumerate(lines):
+                    if line:
+                        subprocess.run(['xdotool', 'type', '--delay', str(key_delay), line],
+                                       env=env, timeout=30)
+                    if i < len(lines) - 1:
+                        subprocess.run(['xdotool', 'key', 'Return'], env=env, timeout=5)
             if special_keys:
                 for key in special_keys:
                     subprocess.run(['xdotool', 'key', key], env=env, timeout=5)
@@ -273,6 +269,14 @@ class DosboxInstance:
 
         try:
             subprocess.run(['import', '-window', wid, path], check=True, env=self._env(), timeout=10)
+            if self.screenshot_scale != 1.0:
+                img = Image.open(path).convert("RGB")
+                img = img.resize(
+                    (max(1, round(img.width * self.screenshot_scale)),
+                     max(1, round(img.height * self.screenshot_scale))),
+                    Image.LANCZOS
+                )
+                img.save(path)
             self.screenshot_count += 1
             print("DEBUG: SCREENSHOT TAKEN AT: ", path)
             return True, path
@@ -282,12 +286,7 @@ class DosboxInstance:
 
 
     def read_screen(self):
-        """OCR the current screen. Returns (ok, text).
-
-        --psm 6 + TESSERACT_TESSDATA_ARGS match ocr_word_find's tuning (see
-        qemuhelpers.py) -- the compact BIOS/DOS font otherwise gets badly
-        misread by tesseract's untuned defaults.
-        """
+        """OCR the current screen -> (ok, text). --psm 6 + TESSERACT_TESSDATA_ARGS as ocr_word_find (qemuhelpers.py); take_screenshot() already upscales by screenshot_scale."""
         ok, path = self.take_screenshot(filename=f"/tmp/{self.name}-ocr.png")
         if not ok:
             return False, path
@@ -319,14 +318,10 @@ class DosboxInstance:
             self.xvfb = None
 
 
-
-
 class DosboxConf:
     def __init__(self, filepath):
         self.filepath = filepath
-        # newline="" disables Python's universal-newline translation so we
-        # see the template's actual line endings, then normalize to bare
-        # lines (no terminator stored) ourselves
+        # newline="": keep template line endings, store lines without terminators
         with open(filepath, "r", newline="") as f:
             raw = f.read()
         self.lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -337,10 +332,7 @@ class DosboxConf:
         self.section_insert("[autoexec]", insert_line)
 
     def section_insert(self, section_header, insert_line):
-        """Insert insert_line as the first line of section_header (e.g.
-        "[dosbox]"), appending the section (and the line) if it isn't
-        present. Section matching is case-insensitive, same as dosbox-x's
-        own conf parser."""
+        """Insert insert_line as the first line of section_header (e.g. "[dosbox]"), appending the section if absent; case-insensitive section match."""
         new_lines = []
         inserted = False
         for line in self.lines:
@@ -354,24 +346,18 @@ class DosboxConf:
         self.lines = new_lines
 
     def disable_quit_warning(self):
-        """dosbox-x's default `quit warning=auto` pops an "Are you sure?"
-        confirmation dialog when the window is closed while a DOS program is
-        running"""
+        """Disable dosbox-x's `quit warning=auto` confirmation dialog."""
         self.section_insert("[dosbox]", "quit warning=false")
 
 
     def autotype_insert(self, buttons, wait=1.0, pace=0.2):
-        """Queue keystrokes into the emulated keyboard from [autoexec].
-
-        AUTOTYPE is a dosbox-x builtin, so it needs no X and no window focus
-        """
+        """Queue keystrokes into the emulated keyboard from [autoexec] (AUTOTYPE builtin; no X or focus needed)."""
         seq = " ".join(buttons)
         self.autoexec_insert(f"autotype -w {wait} -p {pace} {seq}")
 
     def save(self, outpath=None):
         path = outpath if outpath else self.filepath
         print('SAVING NEW CONF TO PATH: ', path)
-        # newline="" for the same reason as __init__: write the \r\n we join
-        # with literally, instead of letting text mode re-translate it.
+        # newline="": write the joined \r\n literally
         with open(path, "w", newline="") as f:
             f.write("\r\n".join(self.lines) + "\r\n")

@@ -6,12 +6,14 @@ import json
 import shutil
 import time
 from PIL import Image, ImageOps
+import math
 import tempfile
 import time
 
 HELPERDIR = os.path.dirname(os.path.abspath(__file__))
 if HELPERDIR not in sys.path:
     sys.path.insert(0, HELPERDIR)
+import windowlayout
 APPBASE_DIR = "/testrunnerapp"
 if APPBASE_DIR not in sys.path:
     sys.path.insert(0, APPBASE_DIR)
@@ -30,76 +32,130 @@ import pytesseract
 import re
 
 
-# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TESTSRC_BASEDIR = "/testsrc"
+TESTSRC_BASEDIR = os.environ.get("TESTSRC_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ocrlogdir = os.path.join(TESTSRC_BASEDIR, "compile_logs")
+# OCR output without a run_id lands here
+OCR_ADHOC_SUBDIR = "_adhoc"
 
-# Prefers the more accurate bundled tessdata model over apt's low-accuracy default.
+
+def ocr_log_dir():
+    """Per-run OCR/screenshot dir compile_logs/<run_id>/, created on demand (swept by reporthelper._move_assets, removed after the report is written)."""
+    run_id = ""
+    try:
+        if APPBASE_DIR not in sys.path:
+            sys.path.insert(0, APPBASE_DIR)
+        from appstate import progress_state
+        run_id = getattr(progress_state, "run_id", "") or ""
+    except Exception:
+        pass
+    d = os.path.join(ocrlogdir, run_id or OCR_ADHOC_SUBDIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+# prefer bundled tessdata over apt's low-accuracy default
 _TESSDATA_DIR = "/usr/local/share/tessdata"
 TESSERACT_TESSDATA_ARGS = (
     f"--tessdata-dir {_TESSDATA_DIR}"
     if os.path.isfile(os.path.join(_TESSDATA_DIR, "eng.traineddata")) else ""
 )
 
+# macOS launchd PATH lacks Homebrew: fall back to Homebrew tesseract locations
+TESSERACT_BIN = shutil.which("tesseract") or next(
+    (p for p in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract")
+     if os.path.isfile(p)),
+    "tesseract")
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_BIN
+
+# limit tesseract OpenMP threads (spin-wait starves the emulator); inherited by all tesseract calls
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+
+_SERIAL_BACKEND_PREFIXES = ("tcp:", "unix:", "socket:", "file:", "pipe:", "vc")
+_SERIAL_BACKEND_EXACT = ("pty", "stdio", "null", "none")
+
+
+def _serial_backend_arg(path):
+    """Value for -serial: bare path -> file:<path> (one-way capture); a string naming a chardev backend (tcp:, unix:, pty, ...) passes through, e.g. "tcp:127.0.0.1:5556,server,nowait"."""
+    if path in _SERIAL_BACKEND_EXACT or path.startswith(_SERIAL_BACKEND_PREFIXES):
+        return path
+    return f"file:{path}"
 
 
 def _as_port(value, default=None):
-    """Coerce a port to an int, or return `default` if it isn't one.
-
-    Step params arrive as strings, so ports need coercion before arithmetic
-    (e.g. monitor_port + 1000). "" / None / junk return `default`.
-    """
+    """Port -> int, else `default` ("" / None / junk)."""
     try:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return default
 
 
+# savevm/loadvm/delvm wait for the monitor prompt this long
+SNAPSHOT_WAIT_S = 120
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def hmp_error(reply):
+    """The "Error: ..." line in an HMP reply, or "" (the reply never starts with "Error": the command echo comes first)."""
+    for line in _ANSI_RE.sub("", reply or "").replace("\r", "").splitlines():
+        line = line.strip()
+        if line.lower().startswith(("error", "invalid", "unknown command")):
+            return line
+    return ""
+
+
 class QemuInstance:
-    # Serializes all monitor socket traffic across threads (RLock avoids self-deadlock).
+    # serializes monitor socket traffic across threads
     lock = threading.RLock()
     def __init__(self, name, cpuarch, monitor_port, hdd1imagepath=None, hdd2imagepath=None, hdd3imagepath=None, hdd4imagepath=None, floppy_path=None, floppy2_path=None, cdrom_path=None, cdrom2_path=None, memory="4M", vnc_port=None,
                  sound_device=None, audio_backend="wav", audio_out_path=None, serial_path=None,
                  pa_out_name=None, pa_in_name=None, pa_server=None,
-                 machine=None, cpu=None, vga=None, net_device=None, mac_address=None,
+                 machine=None, cpu=None, vga=None, net_device=None, mac_address=None, hostfwd=None,
                  bios_path=None, boot_order=None, prom_env=None, extra_args=None,
-                 extra_disks=None, screenshot_scale=None, qemu_binary=None):
+                 extra_disks=None, screenshot_scale=None, qemu_binary=None, loadvm=None,
+                 kernel_path=None, dtb_path=None, kernel_append=None, window_slot=None):
         self.name = name
-        # Overrides the default "qemu-system-<arch>" binary resolved off PATH.
+        # tile slot (dispatch_functions._next_window_slot / windowlayout.tile_position)
+        self.window_slot = window_slot
+        # overrides the "qemu-system-<arch>" binary
         self.qemu_binary = qemu_binary or None
-        # Scales every screenshot this instance takes (CONFIG["ocr_scale"]).
+        # screenshot scale (CONFIG["ocr_scale"]); 1x default because gui_move_to() uses raw screenshot pixel coords
         try:
             self.screenshot_scale = float(screenshot_scale) if screenshot_scale not in (None, "") else 1.0
         except (TypeError, ValueError):
             self.screenshot_scale = 1.0
-        # UTM-style hardware config.plist fields; all optional, default to prior behavior.
+        # UTM config.plist fields; all optional
         self.machine = machine or None
         self.cpu = cpu or None
         self.vga = vga or None
         self.net_device = net_device or None
         self.mac_address = mac_address or None
-        # Real machine ROM; without one QEMU boots its own OpenBIOS.
+        # e.g. "tcp::2222-:22": host port -> guest port in user-mode NAT
+        self.hostfwd = hostfwd or None
+        # machine ROM; else QEMU boots OpenBIOS
         self.bios_path = bios_path or None
         self.boot_order = boot_order or None
-        # -prom-env settings for Open Firmware machines (ppc, sparc).
+        # -prom-env settings (ppc, sparc)
         self.prom_env = list(prom_env or [])
-        # Escape hatch for flags this class doesn't model, appended last.
+        # extra flags appended last
         self.extra_args = list(extra_args or [])
-        # Disks beyond hdd1..hdd4, for non-IDE buses (e.g. SS-5's SCSI chain).
+        # internal-snapshot tag for -loadvm
+        self.loadvm = loadvm or None
+        # disks beyond hdd1..hdd4 (non-IDE buses)
         self.extra_disks = list(extra_disks or [])
         self.cpuarch = cpuarch
         self.monitor_port = _as_port(monitor_port, 55555)
-        # Redirects QEMU's first serial line to a host file; the only "stdout" the console-less m68k mac has.
+        # first serial line -> host file
         self.serial_path = serial_path
-        # Sound is opt-in via sound_device; unset keeps the prior command line.
+        # sound opt-in via sound_device
         self.sound_device = sound_device
         self.audio_backend = (audio_backend or "none").strip().lower()
         self.audio_out_path = audio_out_path
-        # Named PulseAudio/PipeWire sink/source, for cross-wiring two instances in an echo test.
+        # named PulseAudio/PipeWire sink/source (echo tests)
         self.pa_out_name = pa_out_name or None
         self.pa_in_name = pa_in_name or None
         self.pa_server = pa_server or None
-        # Second QMP monitor so outside tools get their own channel instead of queueing behind ours.
+        # second QMP monitor for outside tools
         self.qmp_port = self.monitor_port + 1000
         self.memory = memory
         self.process = None
@@ -112,10 +168,10 @@ class QemuInstance:
         self.hdd3imagepath = hdd3imagepath
         self.hdd4imagepath = hdd4imagepath
         self.cdrom_path = cdrom_path
-        # vnc_port is the real TCP port; -vnc takes a display number (vnc_port - 5900).
+        # vnc_port is the TCP port; -vnc takes the display number (vnc_port - 5900)
         self.vnc_port = _as_port(vnc_port)
         self.vnc_client = None
-        # floppy_path is A:, floppy2_path is B:, resolved against TESTSRC_BASEDIR.
+        # floppy_path = A:, floppy2_path = B:, relative to TESTSRC_BASEDIR
         if floppy_path is not None:
             self.floppy_path = os.path.join(TESTSRC_BASEDIR, floppy_path)
         else:
@@ -125,12 +181,15 @@ class QemuInstance:
         else:
             self.floppy2_path = None
         self.cdrom2_path = cdrom2_path
+        # raspi: kernel+dtb handed to QEMU directly (no firmware boot stage)
+        self.kernel_path = kernel_path or None
+        self.dtb_path = dtb_path or None
+        self.kernel_append = kernel_append or None
 
 
     def wait_for_ready(self, timeout=10):
         start = time.time()
         while time.time() - start < timeout:
-            # Check if process is still running
             if self.process.poll() is not None:
                 self.stdout_lines.append(f"QEMU process exited unexpectedly with code {self.process.returncode}")
                 return False
@@ -155,17 +214,13 @@ class QemuInstance:
                 self.stdout_lines.append(line.strip())
 
 
-    # PC IDE bus has exactly 4 slots (index 0..3); allocated explicitly to avoid -hdc/-cdrom index collisions.
+    # PC IDE bus: 4 slots (0..3), allocated explicitly
     IDE_SLOTS = 4
-    # CD-ROMs prefer the secondary channel; hard disks fill from the primary channel up.
+    # CD-ROMs prefer the secondary channel; hard disks fill from the primary
     _CD_PREFERRED = (2, 3)
 
     def _allocate_ide(self):
-        """Assign IDE slots to the configured disks and CD-ROMs.
-
-        Returns (assignments, error): assignments is a list of (index, path,
-        media); error is set instead when more than IDE_SLOTS devices were requested.
-        """
+        """IDE slots for the configured disks and CD-ROMs -> (assignments [(index, path, media)], error); error if more than IDE_SLOTS."""
         hdds = [p for p in (self.hdd1imagepath, self.hdd2imagepath,
                             self.hdd3imagepath, self.hdd4imagepath) if p]
         cds = [p for p in (self.cdrom_path, self.cdrom2_path) if p]
@@ -185,38 +240,29 @@ class QemuInstance:
 
     @staticmethod
     def _drive_opt(path):
-        """Escape a path for use inside a -drive option string.
-
-        -drive options are comma-separated, so a literal comma in the path
-        must be doubled or it breaks the option parsing.
-        """
+        """Escape a path for a -drive option (commas doubled)."""
         return str(path).replace(",", ",,")
 
     def build_args(self):
-        """Build the QEMU command-line argument list for this instance.
-
-        Shared by start() and write_launch_script(). Returns the args list,
-        or None (with an error recorded in stdout_lines) if cpuarch is unsupported.
-        """
+        """QEMU argument list for this instance (shared by start() and write_launch_script()); None (error in stdout_lines) if cpuarch is unsupported."""
         if self.cpuarch == "i386":
             args = [
                 "qemu-system-i386",
                 "-m", str(self.memory),
                 "-monitor", f"tcp:127.0.0.1:{self.monitor_port},server,nowait",
                 "-qmp", f"tcp:127.0.0.1:{self.qmp_port},server,nowait",
-                # "std" matches legacy behavior when machine/vga aren't configured.
                 "-vga", self._vga_name() or "std"
             ]
-            # Left unset so QEMU's own default (-M pc, target's default CPU) applies.
+            # unset: QEMU defaults (-M pc, default CPU)
             if self.machine:
                 args.extend(["-M", self.machine])
             if self.cpu:
                 args.extend(["-cpu", self.cpu])
             if self.floppy_path:
-                args.extend(["-fda", self.floppy_path])      # A:
+                args.extend(["-fda", self.floppy_path])
             if self.floppy2_path:
-                args.extend(["-fdb", self.floppy2_path])     # B:
-            # Hard disks and CD-ROMs share one 4-slot IDE bus, so slots are allocated together.
+                args.extend(["-fdb", self.floppy2_path])
+            # HDDs and CD-ROMs share the 4-slot IDE bus
             ide, ide_err = self._allocate_ide()
             if ide_err:
                 self.stdout_lines.append(ide_err)
@@ -232,7 +278,7 @@ class QemuInstance:
 
 
         elif self.cpuarch == "m68k":
-            # q800's ASC/EASC sound chip is on-board, enabled via the machine string's audiodev= property, not a -device flag.
+            # q800 ASC/EASC sound is on-board: audiodev= in the machine string
             machine = "q800"
             audio_args = self.build_audio_args()
             if audio_args:
@@ -241,36 +287,44 @@ class QemuInstance:
                           if tok.startswith("id="))
                 machine = f"q800,audiodev={aid}"
             args = [
-                # Resolved off PATH; built from source and installed by the Dockerfile.
                 "qemu-system-m68k",
                 "-L", "pc-bios",
                 "-M", machine,
                 "-m", "64",
-                "-drive", f"id=hd0,file={TESTSRC_BASEDIR}/m68k/pramdisk.img,format=raw,if=none",
+                # snapshot=on: read-only image, writes to a temp file (shared write lock allows only one q800)
+                "-drive", f"id=hd0,file={TESTSRC_BASEDIR}/m68k/pramdisk.img,format=raw,if=none,snapshot=on",
                 "-device", "scsi-hd,scsi-id=0,drive=hd0",
-                "-drive", f"id=hd1,file={TESTSRC_BASEDIR}/m68k/maindisk.img,format=raw,if=none",
+                # boot disk: hdd1_qcow_path (COW overlay, see _prepare_hdd_overlay) else legacy writable maindisk.img
+                "-drive", (f"id=hd1,file={self.hdd1imagepath},format=qcow2,if=none"
+                           if self.hdd1imagepath else
+                           f"id=hd1,file={TESTSRC_BASEDIR}/m68k/maindisk.img,format=raw,if=none"),
                 "-device", "scsi-hd,scsi-id=1,drive=hd1",
-                "-drive", f"id=cd0,file={TESTSRC_BASEDIR}/m68k/MacOS761.iso,media=cdrom,if=none",
-                "-device", "scsi-cd,scsi-id=3,drive=cd0",
                 "-bios", f"{TESTSRC_BASEDIR}/m68k/Quadra-650.ROM",
                 "-boot", "d",
                 "-monitor", f"tcp:127.0.0.1:{self.monitor_port},server,nowait",
                 "-qmp", f"tcp:127.0.0.1:{self.qmp_port},server,nowait"
             ]
-            # Only one of -audio none / -audiodev is ever present, to avoid conflicting flags.
+            # CD-ROM at scsi-id 3 (highest id boots): cdrom_path unset = MacOS761.iso, "none" = no CD (hard disk scsi-id 1 boots), <file> = that image
+            cd = self.cdrom_path
+            if cd is None:
+                cd = f"{TESTSRC_BASEDIR}/m68k/MacOS761.iso"
+            if str(cd).lower() != "none":
+                args.extend(["-drive", f"id=cd0,file={cd},media=cdrom,if=none",
+                             "-device", "scsi-cd,scsi-id=3,drive=cd0"])
+            # only one of -audio none / -audiodev
             if audio_args:
                 args.extend(audio_args)
             else:
                 args.extend(["-audio", "none"])
-            # Optional extra SCSI disk (scsi-id 2) for a host-side Retro68 build's HFS .dsk.
+            # optional SCSI disk (scsi-id 2): Retro68 HFS .dsk
             if self.hdd2imagepath is not None:
                 args.extend([
                     "-drive", f"id=hd2,file={self.hdd2imagepath},format=raw,if=none",
                     "-device", "scsi-hd,scsi-id=2,drive=hd2",
                 ])
-            # Optional line-oriented "stdout" for the console-less q800 (serial port to a host file).
+            # optional serial port -> host file (console-less q800)
             if self.serial_path is not None:
-                args.extend(["-serial", f"file:{self.serial_path}"])
+                args.extend(["-serial", _serial_backend_arg(self.serial_path)])
             if self.vnc_port is not None:
                 vnc_display = self.vnc_port - 5900
                 args.extend(["-vnc", f":{vnc_display}"])
@@ -278,7 +332,12 @@ class QemuInstance:
 
 
         elif self.cpuarch == "ppc":
-            # PowerMac's "screamer" sound chip isn't a machine property or -device; it just picks up a standalone -audiodev as the default.
+            # mac99 has no floppy controller: warn; use hdd2_path (IDE)
+            if self.floppy_path or self.floppy2_path:
+                self.stdout_lines.append(
+                    "WARNING: floppy_path/floppy2_path given but cpuarch=ppc/mac99 has "
+                    "no floppy controller here -- ignored. Use hdd2_path instead.")
+            # PowerMac screamer sound: standalone -audiodev
             machine = self.machine or "mac99"
             audio_args = self.build_audio_args()
             args = [
@@ -290,13 +349,13 @@ class QemuInstance:
             ]
             if self.cpu:
                 args.extend(["-cpu", self.cpu])
-            # mac99 has its own on-board framebuffer; -vga only emitted when named.
+            # mac99 on-board framebuffer; -vga only when named
             if self._vga_name():
                 args.extend(["-vga", self._vga_name()])
             if self.bios_path:
                 args.extend(["-bios", self.bios_path])
             args.extend(audio_args)
-            # Mac OS 9 lives on the IDE bus, same 4 slots as the PC.
+            # Mac OS 9 on the IDE bus (4 slots)
             ide, ide_err = self._allocate_ide()
             if ide_err:
                 self.stdout_lines.append(ide_err)
@@ -310,12 +369,12 @@ class QemuInstance:
             if self.boot_order:
                 args.extend(["-boot", self.boot_order])
             if self.serial_path is not None:
-                args.extend(["-serial", f"file:{self.serial_path}"])
+                args.extend(["-serial", _serial_backend_arg(self.serial_path)])
             if self.vnc_port is not None:
                 args.extend(["-vnc", f":{self.vnc_port - 5900}"])
 
         elif self.cpuarch == "sparc":
-            # SPARCstation: one SCSI chain, not IDE; CD-ROM conventionally at unit 6.
+            # SPARCstation: SCSI chain, CD-ROM at unit 6
             args = [
                 "qemu-system-sparc",
                 "-M", self.machine or "SS-5",
@@ -325,14 +384,14 @@ class QemuInstance:
             ]
             if self.cpu:
                 args.extend(["-cpu", self.cpu])
-            # Without a real Sun PROM image, QEMU boots OpenBIOS, which some Solaris releases refuse.
+            # without a Sun PROM image QEMU boots OpenBIOS (some Solaris releases refuse)
             if self.bios_path:
                 args.extend(["-bios", self.bios_path])
             unit = 0
             for path in [p for p in (self.hdd1imagepath, self.hdd2imagepath,
                                      self.hdd3imagepath, self.hdd4imagepath)
                          if p] + self.extra_disks:
-                if unit == 6:      # reserved for the CD-ROM
+                if unit == 6:
                     unit += 1
                 args.extend(["-drive",
                              f"file={self._drive_opt(path)},if=scsi,bus=0,"
@@ -348,7 +407,51 @@ class QemuInstance:
             if self.boot_order:
                 args.extend(["-boot", self.boot_order])
             if self.serial_path is not None:
-                args.extend(["-serial", f"file:{self.serial_path}"])
+                args.extend(["-serial", _serial_backend_arg(self.serial_path)])
+            if self.vnc_port is not None:
+                args.extend(["-vnc", f":{self.vnc_port - 5900}"])
+
+        elif self.cpuarch in ("arm", "aarch64"):
+            # raspi: kernel+dtb extracted ahead of time, passed via -kernel/-dtb (see raspberry_pi/NOTES.txt)
+            binary = "qemu-system-arm" if self.cpuarch == "arm" else "qemu-system-aarch64"
+            if not self.kernel_path:
+                self.stdout_lines = [
+                    f"cpuarch={self.cpuarch} needs kernel_path (e.g. kernel.img/kernel8.img "
+                    "extracted from the boot partition of the Raspbian image) -- QEMU's raspi "
+                    "machines have no firmware stage to load one off the SD card themselves."]
+                return None
+            args = [
+                binary,
+                "-M", self.machine or ("raspi0" if self.cpuarch == "arm" else "raspi3ap"),
+                "-kernel", self.kernel_path,
+                "-monitor", f"tcp:127.0.0.1:{self.monitor_port},server,nowait",
+                "-qmp", f"tcp:127.0.0.1:{self.qmp_port},server,nowait",
+                "-no-reboot",
+            ]
+            if self.cpu:
+                args.extend(["-cpu", self.cpu])
+            if self.dtb_path:
+                args.extend(["-dtb", self.dtb_path])
+            if self.kernel_append:
+                args.extend(["-append", self.kernel_append])
+            # SD card = hdd1 (qcow2 overlay on the Raspbian template)
+            if self.hdd1imagepath:
+                args.extend(["-drive",
+                             f"file={self._drive_opt(self.hdd1imagepath)},format=qcow2,if=sd"])
+            # raspi has no PS/2: always attach USB controller + keyboard so sendkey works
+            args.extend(["-usb", "-device", "usb-kbd"])
+            # Pi Zero/Zero 2: NIC is usb-net on the same -usb
+            if self.net_device:
+                netdev = "user,id=net0"
+                if self.hostfwd:
+                    netdev += f",hostfwd={self.hostfwd}"
+                args.extend(["-netdev", netdev,
+                             "-device", f"{self.net_device},netdev=net0"])
+            if self.serial_path is not None:
+                args.extend(["-serial", _serial_backend_arg(self.serial_path)])
+            else:
+                # no serial configured: default to stdio
+                args.extend(["-serial", "stdio"])
             if self.vnc_port is not None:
                 args.extend(["-vnc", f":{self.vnc_port - 5900}"])
 
@@ -356,17 +459,19 @@ class QemuInstance:
             self.stdout_lines = [f"Unsupported CPU architecture: {self.cpuarch}"]
             return None
 
-        # Swap in a specific binary when one was given.
         if self.qemu_binary:
             args[0] = self.qemu_binary
+
+        if self.loadvm:
+            args.extend(["-loadvm", self.loadvm])
 
         args.extend(self.extra_args)
         return args
 
-    # Translates UTM device names to QEMU's -vga short type names; unmapped values pass through.
+    # UTM device name -> QEMU -vga type; unmapped pass through
     _VGA_ALIASES = {
         "cirrus-vga": "cirrus",
-        "isa-vga": "std",       # the isapc board has no PCI; QEMU picks isa-vga
+        "isa-vga": "std",
         "vga": "std",
         "vmware-svga": "vmware",
         "virtio-vga": "virtio",
@@ -380,24 +485,22 @@ class QemuInstance:
 
     @staticmethod
     def _audiodev_id(audio_args):
-        """The id= of the -audiodev in `audio_args`, for the machines whose
-        sound chip is enabled by a machine property instead of a -device."""
+        """id= of the -audiodev in `audio_args` (for machines enabling the sound chip by machine property)."""
         backend_spec = audio_args[audio_args.index("-audiodev") + 1]
         return next(tok.split("=", 1)[1] for tok in backend_spec.split(",")
                     if tok.startswith("id="))
 
     def build_net_args(self):
-        """QEMU flags for this instance's NIC, or [] if it has none.
-
-        Always user-mode networking — the test container lacks the
-        CAP_NET_ADMIN a real bridge would need.
-        """
+        """QEMU flags for the NIC, or [] (always user-mode networking)."""
         if not self.net_device:
             return []
         nic = f"{self.net_device},netdev=net0"
         if self.mac_address:
             nic += f",mac={self.mac_address}"
-        return ["-netdev", "user,id=net0", "-device", nic]
+        netdev = "user,id=net0"
+        if self.hostfwd:
+            netdev += f",hostfwd={self.hostfwd}"
+        return ["-netdev", netdev, "-device", nic]
 
     def _prom_env_args(self):
         out = []
@@ -406,17 +509,11 @@ class QemuInstance:
         return out
 
     def build_audio_args(self):
-        """QEMU flags for this instance's sound card, or [] if it has none.
-
-        Backends:
-          wav  — writes mixed output to audio_out_path. Default for automated runs.
-          pa   — routes to the container's PipeWire/pulse socket for a human
-                 listener. pa_out_name/pa_in_name target a specific sink/source;
-                 pa_server picks the PulseAudio server.
-          none — card present, output discarded.
-
-        Recording only works for cards/backends that support an ADC (e.g.
-        ES1370, or the "pa" backend); SB16 is output-only regardless.
+        """QEMU flags for the sound card, or []. Backends:
+          wav   mixed output to audio_out_path (default for automated runs)
+          pa    PipeWire/pulse socket for a listener; pa_out_name/pa_in_name pick sink/source, pa_server the server
+          none  card present, output discarded
+        Recording needs an ADC-capable card/backend (e.g. ES1370, "pa"); SB16 is output-only.
         """
         if not self.sound_device or self.audio_backend in ("", "none"):
             return []
@@ -429,7 +526,7 @@ class QemuInstance:
                 return []
             backend = f"wav,id={aid},path={self.audio_out_path}"
         elif self.audio_backend == "pa":
-            # Named PulseAudio sink/source, for cross-wired echo-box tests.
+            # named PulseAudio sink/source (echo tests)
             backend = f"pa,id={aid}"
             if self.pa_out_name:
                 backend += f",out.name={self.pa_out_name}"
@@ -443,20 +540,18 @@ class QemuInstance:
             return []
 
         if self.cpuarch in ("m68k", "ppc"):
-            # On-board sound chips take only the -audiodev id, via the machine string.
+            # on-board sound: -audiodev id only, via the machine string
             return ["-audiodev", backend]
         return ["-audiodev", backend, "-device", f"{self.sound_device},audiodev={aid}"]
 
     def _prepare_audio(self, env):
-        """Side effects the audio backend needs at launch, kept separate from
-        build_args() so that building a command line has no side effects.
-        """
+        """Side effects the audio backend needs at launch (kept out of build_args())."""
         if not self.sound_device or self.audio_backend in ("", "none"):
             return
 
         if self.audio_backend == "wav" and self.audio_out_path:
             os.makedirs(os.path.dirname(self.audio_out_path) or ".", exist_ok=True)
-            # Clears a stale capture so a silent guest can't pass on a previous run's audio.
+            # clear stale capture
             try:
                 os.remove(self.audio_out_path)
             except FileNotFoundError:
@@ -465,26 +560,23 @@ class QemuInstance:
                 self.stdout_lines.append(f"[audio] could not clear {self.audio_out_path}: {e}")
 
         elif self.audio_backend == "pa":
-            # Fills in PipeWire env vars the non-login flask runner lacks.
+            # fill PipeWire env vars the flask runner lacks
             env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
             env.setdefault("PULSE_SERVER",
                            f"unix:{env['XDG_RUNTIME_DIR']}/pulse/native")
 
     def referenced_disk_images(self, args=None):
-        """Return the disk/floppy/CD-ROM/BIOS paths this instance's QEMU args
-        point at. Only paths that exist on disk are returned, in command-line
-        order and de-duplicated.
-        """
+        """Disk/floppy/CD-ROM/BIOS paths the QEMU args point at; existing only, command-line order, de-duplicated."""
         if args is None:
             args = self.build_args() or []
-        # Flags whose *following* arg is a bare path (e.g. -hda /path).
+        # flags followed by a bare path (e.g. -hda /path)
         path_flags = {"-hda", "-hdb", "-hdc", "-hdd", "-fda", "-fdb",
-                      "-bios", "-cdrom"}
+                      "-bios", "-cdrom", "-kernel", "-dtb"}
         found, prev = [], None
         for a in args:
             if prev in path_flags:
                 found.append(a)
-            # -drive/-device specs carry the path in a file=... token.
+            # -drive/-device: path in file=...
             for tok in a.split(","):
                 if tok.startswith("file="):
                     found.append(tok[len("file="):])
@@ -497,9 +589,7 @@ class QemuInstance:
         return out
 
     def write_launch_script(self, path=None):
-        """Write an executable shell script that launches QEMU with this
-        instance's parameters. Returns (success, path_or_error).
-        """
+        """Write an executable shell script that launches QEMU with these parameters -> (success, path_or_error)."""
         import shlex
         args = self.build_args()
         if args is None:
@@ -545,22 +635,18 @@ class QemuInstance:
 
         processreg.register(self.name, self.process, source="qemu")
 
-        # Wait briefly to see if process exits immediately
         time.sleep(1)
         retcode = self.process.poll()
 
         if retcode is not None:
-            # Process exited immediately - capture all output
             output, _ = self.process.communicate(timeout=1)
             self.stdout_lines = [output] if output else ["[no output captured]"]
             return False
 
-        # Process is still running - start thread for async read
         self.stdout_thread = threading.Thread(target=self._read_stdout, name="QEMU-stdout-reader")
         self.stdout_thread.daemon = True
         self.stdout_thread.start()
 
-        # Wait some time for output to appear
         start_time = time.time()
         while time.time() - start_time < 5:
             if self.stdout_lines:
@@ -576,8 +662,20 @@ class QemuInstance:
             self.stdout_lines.append(f"[monitor socket error] {e}")
             return False
 
+        self._reposition_window_to_origin()
+
         return True
 
+    def _reposition_window_to_origin(self, attempts=15, delay=0.3):
+        """Move the QEMU GTK window onto its round-robin tile (windowlayout.tile_position) right after launch, clamped by its own size against the session; polls for the window to appear."""
+        display = os.environ.get("DISPLAY")
+        for _ in range(attempts):
+            wid, w, h = self._gui_find_window()
+            if wid:
+                x, y = windowlayout.tile_position(self.window_slot, (w, h), display)
+                self._xdo("windowmove", wid, str(x), str(y))
+                return
+            time.sleep(delay)
 
     def take_screenshot(self, test_step=None, filename=None):
         _helperdir = "/testrunnersrc/pyhelpers"
@@ -585,7 +683,7 @@ class QemuInstance:
             sys.path.insert(0, _helperdir)
         from appstate import progress_state, current_reports_dir
         stepnum = progress_state.step
-        # Guards against AttributeError when the live view screenshots an idle instance ("Idle", no digits).
+        # idle instance ("Idle", no digits) would raise AttributeError
         _m = re.match(r'\d+', stepnum or "")
         stepnum = _m.group(0) if _m else "live"
         if not test_step:
@@ -618,7 +716,7 @@ class QemuInstance:
                         return False, "Monitor disconnected"
                     buf += chunk
 
-                # Waits for the PPM's size to stabilize; avoids reading a mid-write file as "truncated".
+                # wait for the PPM size to stabilize
                 start = time.time()
                 last_size = -1
                 stable = 0
@@ -711,7 +809,6 @@ class QemuInstance:
 
 
     def send_specialkeys(self, keystr, ctrl=False, alt=False, shift=False, delay=0.1):
-        # For sending function keys, return, alt, etc.
         key = keystr.lower()
 
         if key == 'enter':
@@ -724,7 +821,8 @@ class QemuInstance:
         self.send_key(keystr.lower(), ctrl=ctrl, alt=alt, shift=shift, delay=delay)
 
 
-    def send_command(self, cmd):
+    def send_command(self, cmd, wait_prompt=None):
+        """Send one HMP command -> printed reply. A 2s output lull ends the read; wait_prompt=N reads until the next "(qemu)" prompt or N seconds (savevm/loadvm)."""
         with self.lock:
             try:
                 self.sock.settimeout(0.2)
@@ -754,12 +852,37 @@ class QemuInstance:
                     if prompt_count >= 1 and data.strip().endswith("(qemu)"):
                         break
                 except socket.timeout:
+                    if wait_prompt and time.time() - start < wait_prompt:
+                        continue
                     break
-                if time.time() - start > 5:
+                if time.time() - start > (wait_prompt or 5):
                     break
 
             return data.strip()
 
+
+    def pause_vm(self):
+        """HMP 'stop': quiesce the guest (before savevm)."""
+        return self.send_command("stop")
+
+    def resume_vm(self):
+        """Restarts the guest CPU (HMP 'cont') after pause_vm/save_snapshot."""
+        return self.send_command("cont")
+
+    def save_snapshot(self, tag="quicksave"):
+        """Pause, write an internal qcow2 snapshot `tag` (HMP 'savevm'), resume. Lives in hdd1's qcow2; `loadvm=` boots into it. Every writable disk must be qcow2 and one must hold the VM state. Check the reply with hmp_error()."""
+        self.pause_vm()
+        reply = self.send_command(f"savevm {tag}", wait_prompt=SNAPSHOT_WAIT_S)
+        self.resume_vm()
+        return reply
+
+    def load_snapshot(self, tag="quicksave"):
+        """Restore a snapshot into a running instance (HMP 'loadvm'); for a fresh process pass `loadvm=tag` to __init__/test_startqemu. Check the reply with hmp_error()."""
+        return self.send_command(f"loadvm {tag}", wait_prompt=SNAPSHOT_WAIT_S)
+
+    def delete_snapshot(self, tag):
+        """Drops an internal snapshot (HMP 'delvm') from every disk holding it."""
+        return self.send_command(f"delvm {tag}", wait_prompt=SNAPSHOT_WAIT_S)
 
     def send_mouse_pos(self, x, y, dz=None):
         if not self.sock:
@@ -777,8 +900,7 @@ class QemuInstance:
 
 
     def _monitor_send(self, cmd, drain_timeout=2.0):
-        """Send one HMP command and drain up to the next (qemu) prompt so the
-        socket buffer stays clean for the next screendump read."""
+        """Send one HMP command and drain to the next (qemu) prompt."""
         if not self.sock:
             return False, "Monitor socket not connected"
         try:
@@ -802,8 +924,7 @@ class QemuInstance:
             return False, f"Monitor command failed ({cmd!r}): {e}"
 
     def mouse_click(self, button=1, hold=0.15):
-        """Press then release a mouse button on the ADB mouse via the HMP
-        monitor. mouse_button state is a bitmask: 1=L, 2=R, 4=M."""
+        """Press then release an ADB mouse button via HMP; mouse_button bitmask: 1=L, 2=R, 4=M."""
         ok, _ = self._monitor_send(f"mouse_button {button}")
         if not ok:
             return False, f"Failed to press mouse button {button}"
@@ -812,10 +933,7 @@ class QemuInstance:
         return True, f"Mouse button {button} clicked"
 
     def mouse_move_to(self, x, y, settle=0.4):
-        """Position the relative ADB mouse at absolute (x, y) by pegging it
-        to the top-left corner first, then moving by (x, y). Not pixel-exact:
-        classic Mac OS applies mouse acceleration.
-        """
+        """Place the relative ADB mouse at absolute (x, y): peg top-left, then move by (x, y); not pixel-exact (acceleration)."""
         for _ in range(3):
             self._monitor_send("mouse_move -4000 -4000")
             time.sleep(0.1)
@@ -825,8 +943,7 @@ class QemuInstance:
         return ok, f"Mouse positioned near ({x}, {y}) via corner-reset"
 
 
-    # ── GUI mouse control via the QEMU GTK window + xdotool ──────────────────
-    # Drives xdotool in a screendump-feedback loop, since the relative ADB mouse can't be positioned via monitor/VNC.
+    # GUI mouse via QEMU GTK window + xdotool, in a screendump-feedback loop (relative ADB mouse can't be positioned via monitor/VNC)
 
     @staticmethod
     def _xdo(*a):
@@ -881,20 +998,18 @@ class QemuInstance:
         return None, None, None
 
     def gui_move_to(self, gx, gy, do_click=True, button=1,
-                    tol=3, gain=0.5, cap=28, max_iter=90, clicks=1):
-        """Position the guest mouse at guest-framebuffer pixel (gx, gy) and
-        optionally click, driving the GTK window with xdotool in a
-        screendump-feedback loop. Returns (success, log).
-
-        clicks>1 sends a multi-click without moving between presses, to open
-        a Finder icon rather than just select it.
+                    tol=3, gain=0.5, cap=28, max_iter=90, clicks=1,
+                    drag_to=None, hold_s=0.0, dwell_s=1.0):
+        """Position the guest mouse at framebuffer pixel (gx, gy) and optionally click, via the GTK window with xdotool in a screendump-feedback loop -> (success, log).
+        clicks>1: multi-click without moving (opens a Finder icon).
+        drag_to=(x2, y2): press-drag-release; the route is driven first with the button UP recording every relative move, then replayed with the button DOWN. hold_s>0 pauses after the press and before the release.
         """
         log = []
         wid, W, H = self._gui_find_window()
         if not wid:
             return False, "GUI window not found (needs QEMU -display gtk on an X display)"
 
-        # Grab the (relative) pointer by clicking once in the window.
+        # grab the pointer: click once in the window
         self._xdo("windowactivate", wid); time.sleep(0.3)
         self._xdo("mousemove", "--window", wid, str(W // 2), str(H // 2)); time.sleep(0.2)
         self._xdo("click", "1"); time.sleep(0.5)
@@ -908,46 +1023,93 @@ class QemuInstance:
         def rel(dx, dy):
             self._xdo("mousemove_relative", "--", str(int(dx)), str(int(dy)))
 
-        peg(45, 45)                      # park cursor bottom-right = reference
+        peg(45, 45)
         ref = self._gui_screencap()
         if ref is None:
             return False, "screencap failed (monitor screendump)"
         gh, gw = ref.shape[:2]
 
         def detect():
+            """Arrow tip = top-left pixel of the arrow-sized cluster of changed pixels (menu-bar clock area masked; text caret ignored)."""
             cur = self._gui_screencap()
             if cur is None:
                 return None
-            d = np.abs(cur - ref).sum(axis=2)
-            ys, xs = np.where(d > 60)
-            keep = ~((xs > gw - 55) & (ys > gh - 80))   # ignore parked corner
-            xs, ys = xs[keep], ys[keep]
-            if len(xs) == 0:
+            m = np.abs(cur - ref).sum(axis=2) > 60
+            m[:24, 470:] = False
+            m[gh - 80:, gw - 55:] = False
+            if not m.any():
                 return None
-            return (int(xs.min()), int(ys.min()))       # arrow tip = hotspot
+            bw, bh = 14, 20
+            ii = np.pad(m.astype(np.int32).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+            ys, xs = np.where(m)
+            y1 = np.minimum(ys + bh, gh); x1 = np.minimum(xs + bw, gw)
+            cnt = ii[y1, x1] - ii[ys, x1] - ii[y1, xs] + ii[ys, xs]
+            ok = cnt >= 30
+            if not ok.any():
+                return None
+            i = np.lexsort((xs[ok], ys[ok]))[0]
+            return (int(xs[ok][i]), int(ys[ok][i]))
 
-        peg(-45, -45)                    # start from top-left
-        last = None
-        for _ in range(max_iter):
-            c = detect()
-            if c is None:
-                rel(6, 6); continue
-            last = c
-            ex, ey = gx - c[0], gy - c[1]
-            if abs(ex) <= tol and abs(ey) <= tol:
-                break
-            rel(max(-cap, min(cap, ex * gain)), max(-cap, min(cap, ey * gain)))
-            time.sleep(0.1)
-        err = None if last is None else (gx - last[0], gy - last[1])
+        def track(tx, ty, trace=None):
+            """Closed-loop move to (tx, ty); returns (last_seen, residual)."""
+            last = None
+            for _ in range(max_iter):
+                c = detect()
+                if c is None:
+                    rel(6, 6)
+                    if trace is not None:
+                        trace.append((6, 6, 0.0))
+                    continue
+                last = c
+                ex, ey = tx - c[0], ty - c[1]
+                if abs(ex) <= tol and abs(ey) <= tol:
+                    break
+                dx = max(-cap, min(cap, ex * gain))
+                dy = max(-cap, min(cap, ey * gain))
+                rel(dx, dy)
+                if trace is not None:
+                    trace.append((int(dx), int(dy), 0.1))
+                time.sleep(0.1)
+            return last, (None if last is None else (tx - last[0], ty - last[1]))
+
+        peg(-45, -45)
+        last, err = track(gx, gy)
         log.append(f"positioned cursor at {last} (target {gx},{gy}, residual {err})")
+        if drag_to is not None:
+            # target (x, y) or waypoints [(x, y), ...]: button stays down, dwell_s at each
+            wps = [tuple(drag_to)] if isinstance(drag_to[0], int) else [tuple(w) for w in drag_to]
+            segs = []
+            for x2, y2 in wps:
+                trace = []
+                last2, err2 = track(x2, y2, trace)
+                log.append(f"drag route learned: {len(trace)} moves to {last2} "
+                           f"(target {x2},{y2}, residual {err2})")
+                if last2 is None:
+                    return False, "\n".join(log) + "\ndrag: cursor lost on the route"
+                segs.append(trace)
+            back, errb = track(gx, gy)
+            log.append(f"returned to {back} (residual {errb})")
+            time.sleep(0.3)
+            self._xdo("mousedown", str(button))
+            time.sleep(0.12 + hold_s)
+            for i, trace in enumerate(segs):
+                for dx, dy, dt in trace:
+                    rel(dx, dy)
+                    time.sleep(dt)
+                if i + 1 < len(segs):
+                    time.sleep(dwell_s)
+            time.sleep(0.3 + hold_s)
+            self._xdo("mouseup", str(button))
+            log.append(f"dragged ({gx},{gy}) -> {wps} replaying {sum(map(len, segs))} moves")
+            return True, "\n".join(log)
         if do_click:
-            time.sleep(0.3)                       # let the cursor settle
+            time.sleep(0.3)
             for i in range(max(1, int(clicks))):
                 self._xdo("mousedown", str(button))
-                time.sleep(0.12)                  # hold, so the guest registers it
+                time.sleep(0.12)
                 self._xdo("mouseup", str(button))
                 if i + 1 < clicks:
-                    time.sleep(0.08)              # < double-click time; no move
+                    time.sleep(0.08)
             log.append(f"clicked button {button} x{max(1, int(clicks))} at ({gx},{gy})")
         return True, "\n".join(log)
 
@@ -975,7 +1137,7 @@ class QemuInstance:
         if not self.vnc_client:
             return False, "VNC client not connected"
         try:
-            # Settles the pointer before pressing, since vncdotool sends events asynchronously.
+            # settle the pointer before pressing (vncdotool is async)
             self.vnc_client.mouseMove(x, y)
             time.sleep(0.3)
             self.vnc_client.mousePress(button)
@@ -1034,7 +1196,7 @@ class QemuInstance:
                 time.sleep(interval)
 
             gif_path = os.path.abspath(os.path.join("reports", gif_name))
-            frame_duration = max(1, int(1000.0 / framerate))  # ms per frame
+            frame_duration = max(1, int(1000.0 / framerate))
 
             frames[0].save(
                 gif_path,
@@ -1080,20 +1242,6 @@ class QemuInstance:
         return True, f"[{self.name}] Eject command sent."
 
 
-    def save_snapshot(self, name="snap1"):
-        response = self.send_command(f"savevm {name}")
-        if "error" in response.lower():
-            return False, f"[{self.name}] Failed to save snapshot: {response}"
-        return True, f"[{self.name}] Snapshot '{name}' saved successfully."
-
-
-    def load_snapshot(self, name="snap1"):
-        response = self.send_command(f"loadvm {name}")
-        if "error" in response.lower():
-            return False, f"[{self.name}] Failed to load snapshot: {response}"
-        return True, f"[{self.name}] Snapshot '{name}' loaded successfully."
-
-
     def stop(self):
         self.vnc_disconnect()
         processreg.unregister(self.name)
@@ -1108,7 +1256,7 @@ class QemuInstance:
 class MouseAction:
     @staticmethod
     def closedialogbutton(instance, test_step):
-        button_path = "/testsrc/buttontest/finder_window_closebutton.png"
+        button_path = os.path.join(TESTSRC_BASEDIR, "buttontest", "finder_window_closebutton.png")
         offset_x=-150
         offset_y=-190
         if not instance:
@@ -1127,7 +1275,7 @@ class MouseAction:
         if success:
             x, y = pos
             log.append(f"Button found at {pos}")
-            ok, msg = instance.gui_move_to(x, y, do_click=True)  # GTK closed-loop
+            ok, msg = instance.gui_move_to(x, y, do_click=True)
             log.append(msg)
             ok, screenshot_path = instance.take_screenshot(test_step)
         else:
@@ -1138,7 +1286,7 @@ class MouseAction:
 
     def findandclicktitlebar(instance, test_step):
         
-        button_path = "/testsrc/buttontest/inactive_titlebar_system7.png"
+        button_path = os.path.join(TESTSRC_BASEDIR, "buttontest", "inactive_titlebar_system7.png")
         offset_x=-150
         offset_y=-190
         if not instance:
@@ -1158,41 +1306,268 @@ class MouseAction:
             x, y = pos
             log.append(f"Button found at {pos}")
 
-            ok, msg = instance.gui_move_to(x, y, do_click=True)  # GTK closed-loop
+            ok, msg = instance.gui_move_to(x, y, do_click=True)
             log.append(msg)
-            # debug , 2nd screenshot to confirm the mouseclick
             ok, screenshot_path = instance.take_screenshot(test_step)
         else:
             log.append("Button not found")
 
         return success, "\n".join(log)
 
+    @staticmethod
+    def click_screen_center(instance, test_step):
+        """Click the center of the guest framebuffer via gui_move_to (no image match)."""
+        if not instance:
+            return False, "No instance provided"
 
-def ocr_word_find(instance, successphrase, numberofattempts=5, attemptdelay=2, startx=None, starty=None, stopx=None, stopy=None, errorphrase=None):
-    os.makedirs(ocrlogdir, exist_ok=True)
+        log = []
+        w = getattr(instance, "screen_width", None) or 1024
+        h = getattr(instance, "screen_height", None) or 768
+        gx, gy = w // 2, h // 2
+
+        ok, msg = instance.gui_move_to(gx, gy, do_click=True)
+        log.append(f"Clicked screen center ({gx}, {gy}): {msg}")
+        return ok, "\n".join(log)
+
+    @staticmethod
+    def move_screen_center(instance, test_step):
+        """Move (no click) to the center of the guest framebuffer, to park the cursor away from corner content before an OCR check."""
+        if not instance:
+            return False, "No instance provided"
+
+        log = []
+        w = getattr(instance, "screen_width", None) or 1024
+        h = getattr(instance, "screen_height", None) or 768
+        gx, gy = w // 2, h // 2
+
+        ok, msg = instance.gui_move_to(gx, gy, do_click=False)
+        log.append(f"Moved to screen center ({gx}, {gy}): {msg}")
+        return ok, "\n".join(log)
+
+
+def _text_area(img, scale_factor=1.0):
+    """(x0, y0, x1, y1) pixels of the emulator output part of a screenshot. 86Box/DOSBox captures include menu/toolbar/status bars (flat neutral light grey, Qt 216..253); bars are trimmed from each edge while at least half their pixels are flat chrome. QEMU/VNC captures come back whole, as does anything leaving under 40%."""
+    step = max(1, int(round(scale_factor)))
+    rgb = np.asarray(img.convert("RGB"))[step // 2::step, step // 2::step].astype(np.int16)
+    h, w = rgb.shape[:2]
+    lum = rgb.sum(axis=2) // 3
+    grey = (rgb.max(axis=2) - rgb.min(axis=2) <= 6) & (lum >= 205) & (lum <= 252)
+    flat = grey.copy()
+    flat[1:-1, 1:-1] = grey[1:-1, 1:-1]
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            flat[1:-1, 1:-1] &= grey[1 + dy:h - 1 + dy, 1 + dx:w - 1 + dx]
+    flat[0, :] = flat[-1, :] = flat[:, 0] = flat[:, -1] = False
+
+    def trim(flags):
+        """(leading, trailing) counts of chrome entries; gaps of <= 3 (icon rows) are bridged."""
+        idx = np.flatnonzero(flags)
+        if len(idx) == 0:
+            return 0, 0
+        n = len(flags)
+        lead = trail = 0
+        if idx[0] <= 2:
+            end = idx[0]
+            for i in idx[1:]:
+                if i - end > 4:
+                    break
+                end = i
+            lead = end + 1
+        if idx[-1] >= n - 3:
+            start = idx[-1]
+            for i in idx[::-1][1:]:
+                if start - i > 4:
+                    break
+                start = i
+            trail = n - start
+        return lead, trail
+
+    # skip the blurred chrome edge (3 native px) wherever a bar was cut
+    def ringing(n, k):
+        return n + k if n else 0
+
+    top, bottom = trim(flat.mean(axis=1) >= 0.5)
+    top, bottom = ringing(top, 3), ringing(bottom, 2)
+    if bottom + top >= h:
+        return 0, 0, img.width, img.height
+    left, right = trim(flat[top:h - bottom].mean(axis=0) >= 0.5)
+    left, right = ringing(left, 3), ringing(right, 2)
+    y0, y1 = top * step, img.height - bottom * step
+    x0, x1 = left * step, img.width - right * step
+    if (y1 - y0) < img.height * 0.4 or (x1 - x0) < img.width * 0.5:
+        return 0, 0, img.width, img.height
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _text_grid(native_w, native_h, row_colors=None):
+    """(cols, rows) for a text area of native_w x native_h pixels (before OCR upscale). Cell height 16, 14 or 8 px: the first whose row count tiles native_h within 2.5 px (400 = 25x16; 392 = 28x14; 344 = 43x8). `row_colors` (native_h x 3) decides 400 (16 vs 8): background changes at odd multiples of 8 mean 8-px cells. Columns 80 (or 40) if native_w is that many 8/9-px cells, else width/8."""
+    fits = [c for c in (16, 14, 8) if abs(native_h - round(native_h / c) * c) <= 2.5]
+    cell = fits[0] if fits else 16
+    if 16 in fits and 8 in fits and row_colors is not None and len(row_colors) > 24:
+        jump = np.abs(np.diff(row_colors.astype(float), axis=0)).sum(axis=1)
+        ys = np.flatnonzero(jump >= 30) + 1
+        on16 = sum(1 for y in ys if min(y % 16, 16 - y % 16) <= 1)
+        on8 = sum(1 for y in ys if abs(y % 16 - 8) <= 1)
+        if on8 > on16:
+            cell = 8
+    rows = max(1, int(round(native_h / cell)))
+    for c in (80, 40):
+        if min(abs(native_w - c * 8), abs(native_w - c * 9)) <= 1.5:
+            return c, rows
+    return (80 if 560 <= native_w <= 760 else max(1, int(round(native_w / 8)))), rows
+
+
+def _normalize_polarity(img, scale_factor=1.0, min_scale=3, border=20):
+    """Dark-on-white grayscale copy of a screen for tesseract's second pass: each text cell is flipped when most of it is darker than the midpoint of its min/max, contrast-stretched to 0..255, uniform cells white; grayscale kept.
+    The cell grid is laid on the detected text area only (_text_area, _text_grid); whole image if none. Vectorised. Also Lanczos-upscaled to at least `min_scale`x native with a white border.
+    """
+    x0, y0, x1, y1 = _text_area(img, scale_factor)
+    area = img.crop((x0, y0, x1, y1))
+    lum = np.asarray(area.convert("L"), dtype=np.int32)
+    h, w = lum.shape
+    step = max(1, int(round(scale_factor)))
+    native = np.asarray(area.convert("RGB"))[step // 2::step, step // 2::step]
+    cols, rows = _text_grid(w / scale_factor, h / scale_factor, native.mean(axis=1))
+    ys = np.linspace(0, h, rows + 1).round().astype(int)
+    xs = np.linspace(0, w, cols + 1).round().astype(int)
+    lo = np.minimum.reduceat(np.minimum.reduceat(lum, ys[:-1], axis=0), xs[:-1], axis=1)
+    hi = np.maximum.reduceat(np.maximum.reduceat(lum, ys[:-1], axis=0), xs[:-1], axis=1)
+    rh, cw = np.diff(ys), np.diff(xs)
+
+    def expand(a):
+        return np.repeat(np.repeat(a, rh, axis=0), cw, axis=1)
+    mid = (lo + hi) // 2
+    dark = (lum < expand(mid)).astype(np.int32)
+    frac = np.add.reduceat(np.add.reduceat(dark, ys[:-1], axis=0), xs[:-1], axis=1) / np.outer(rh, cw)
+    lo_p, hi_p = expand(lo), expand(hi)
+    flip = expand(frac > 0.5)
+    flat = expand((hi - lo) < 40)
+    cell = np.where(flip, hi_p + lo_p - lum, lum)
+    span = np.maximum(hi_p - lo_p, 1)
+    out = np.where(flat, 255, (cell - lo_p) * 255 // span)
+    norm = Image.fromarray(out.astype(np.uint8))
+    if scale_factor < min_scale:
+        f = math.ceil(min_scale / scale_factor)
+        norm = norm.resize((w * f, h * f), Image.LANCZOS)
+    return ImageOps.expand(norm, border=border, fill=255)
+
+
+_NORM_POOL = None
+_NORM_POOL_LOCK = threading.Lock()
+
+
+def _ocr_parallel():
+    """Run the normalized OCR pass alongside the raw one? Only with >= 8 cores; OCR_SERIAL=1 forces sequential."""
+    return (os.cpu_count() or 1) >= 8 and not os.environ.get("OCR_SERIAL")
+
+
+def _norm_pool():
+    global _NORM_POOL
+    with _NORM_POOL_LOCK:
+        if _NORM_POOL is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _NORM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ocr-norm")
+        return _NORM_POOL
+
+
+def _normalized_ocr(img, scale_factor, ocr_config, save_path):
+    """Polarity-normalize `img`, keep the image for the report, OCR it. -> (text, seconds)"""
+    t0 = time.time()
+    norm = _normalize_polarity(img, scale_factor)
+    norm.save(save_path)
+    return pytesseract.image_to_string(norm, config=ocr_config), time.time() - t0
+
+
+def phrase_list(value):
+    """Phrase param (string or list; None / "" / [] = none) -> list of non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v not in (None, "")]
+    return [str(value)] if str(value) != "" else []
+
+
+def _ocr_scratch_dir():
+    """Host-local per-run dir for OCR screenshots/text: nothing written here is re-read through the shared mount."""
+    run_id = ""
+    try:
+        if APPBASE_DIR not in sys.path:
+            sys.path.insert(0, APPBASE_DIR)
+        from appstate import progress_state
+        run_id = getattr(progress_state, "run_id", "") or ""
+    except Exception:
+        pass
+    d = os.path.join(tempfile.gettempdir(), "ocr_scratch", run_id or OCR_ADHOC_SUBDIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+MIRROR_TIMEOUT = 20   # seconds to wait on the shared mount before giving up on the report copies
+
+
+def _mirror_ocr_files(src_dir, names):
+    """Copy this OCR wait's files to compile_logs/<run_id>/ for the report. Best effort on a daemon thread: a hung or erroring shared mount must not stall or fail the test."""
+    import threading
+
+    def work():
+        try:
+            dst = ocr_log_dir()
+            for n in names:
+                p = os.path.join(src_dir, n)
+                if os.path.isfile(p):
+                    shutil.copy2(p, os.path.join(dst, n))
+        except Exception as e:
+            print(f"OCR report copy to shared mount failed: {e}")
+
+    t = threading.Thread(target=work, daemon=True, name="ocr-mirror")
+    t.start()
+    t.join(MIRROR_TIMEOUT)
+
+
+def ocr_word_find(instance, successphrase, *args, **kwargs):
+    """ocr_word_find_local() with its screenshots/text kept on a host-local dir, then copied to compile_logs/ for the report."""
+    scratch = _ocr_scratch_dir()
+    started = time.time() - 1
+    try:
+        return _ocr_word_find_local(instance, successphrase, scratch, *args, **kwargs)
+    finally:
+        _mirror_ocr_files(scratch, [n for n in os.listdir(scratch)
+                                    if os.path.getmtime(os.path.join(scratch, n)) >= started])
+
+
+def _ocr_word_find_local(instance, successphrase, ocr_dir, numberofattempts=5, attemptdelay=2, startx=None, starty=None, stopx=None, stopy=None, errorphrase=None, whilephrase=None, notphrase=None, should_stop=None):
+    """Poll the screen until EVERY successphrase is on it and NO notphrase is. successphrase / notphrase: string or list. whilephrase = old name of notphrase. errorphrase hard-fails at once."""
     log = []
 
     start_time = time.time()
-    # No successphrase means one OCR pass with no waiting, just capturing screen text.
-    phrase_lower = successphrase.lower() if successphrase else None
+    # no successphrase: one OCR pass, capture screen text
+    success_phrases = phrase_list(successphrase)
+    phrases_lower = [p.lower() for p in success_phrases]
     error_lower = errorphrase.lower() if errorphrase else None
+    # notphrase: blocks success while on screen (keeps polling)
+    not_phrases = phrase_list(notphrase) + phrase_list(whilephrase)
+    nots_lower = [p.lower() for p in not_phrases]
     attempts = 0
     text = ""
 
-    # Crop coords are native-resolution; scale them to match the pre-scaled screenshot.
+    # crop coords are native-resolution: scale to the screenshot
     scale_factor = float(getattr(instance, "screenshot_scale", 1.0) or 1.0)
 
-    # Ends the wait immediately if the emulator exits (only DOSBox-X/86Box expose is_alive()).
+    # end the wait if the emulator exits (is_alive(): DOSBox-X/86Box)
     alive = getattr(instance, "is_alive", None)
     inst_name = getattr(instance, "name", "instance")
-    # Lets callers reuse this loop's last screenshot instead of taking a redundant one.
+    # reuse the last screenshot
     last_screenshot_path = None
 
     for i in range(numberofattempts):
+        # should_stop: the run's Pause/Stop/Abandon (context["abort"])
+        if should_stop is not None and should_stop():
+            log.append("aborted (stop requested) — abandoning OCR wait")
+            return False, text, attempts, log, last_screenshot_path
         if alive is not None and not alive():
             returncode = getattr(getattr(instance, "process", None), "returncode", None)
             log.append(f"{inst_name} exited (code {returncode}) — abandoning OCR wait")
-            # Gives the stdout-reader thread a beat to drain the last lines after poll() reaps the process.
+            # let the stdout reader drain after poll()
             time.sleep(0.2)
             tail = getattr(instance, "stdout_lines", None)
             if tail:
@@ -1203,12 +1578,12 @@ def ocr_word_find(instance, successphrase, numberofattempts=5, attemptdelay=2, s
         iter_start = time.time()
 
         elapsed = int(iter_start - start_time)
-        safe_phrase = (successphrase or "screen").replace(" ", "_")
-        # PID-tagged so concurrent tests sharing ocrlogdir don't overwrite each other's output.
+        safe_phrase = (success_phrases[0] if success_phrases else "screen").replace(" ", "_")[:60]
+        # PID-tagged: concurrent tests share the ocr dir
         pid = getattr(getattr(instance, "process", None), "pid", None)
         run_tag = f"{getattr(instance, 'name', 'inst')}-{pid if pid is not None else id(instance)}"
         filename_base = f"{run_tag}_{safe_phrase}_{elapsed}"
-        screenshot_path = os.path.join(ocrlogdir, filename_base)
+        screenshot_path = os.path.join(ocr_dir, filename_base)
         png_path = screenshot_path + ".png"
         txt_path = screenshot_path + ".txt"
 
@@ -1222,24 +1597,44 @@ def ocr_word_find(instance, successphrase, numberofattempts=5, attemptdelay=2, s
 
         try:
             crop_start = time.time()
+            # OCR the file just written, not instance.last_image: another thread's grab (GIF recorder) may have replaced it, and the report shows png_path
             img = Image.open(png_path)
 
-            # Ensure coordinates are ints before cropping
             if all(v is not None and str(v).isdigit() for v in (startx, starty, stopx, stopy)):
                 box = (int(startx), int(starty), int(stopx), int(stopy))
                 if scale_factor != 1.0:
                     box = tuple(round(v * scale_factor) for v in box)
                 img = img.crop(box)
 
+            img.load()
             crop_duration = time.time() - crop_start
             log.append(f"Crop completed in {float(crop_duration):.2f} seconds")
 
             ocr_start = time.time()
-            # --psm 6 fixes Tesseract misreading a VGA text screen as a multi-column page.
+            # --psm 6 for VGA text; feed color, not grayscale (as liveview._ocr_png)
             ocr_config = f"--psm 6 {TESSERACT_TESSDATA_ARGS}".strip()
-            text = pytesseract.image_to_string(ImageOps.grayscale(img), config=ocr_config)
+            # spare cores: start the polarity-normalized pass now (see _ocr_parallel)
+            norm_future = None
+            if phrases_lower and _ocr_parallel():
+                norm_future = _norm_pool().submit(_normalized_ocr, img, scale_factor, ocr_config,
+                                                  screenshot_path + "_norm.png")
+            text = pytesseract.image_to_string(img, config=ocr_config)
             ocr_duration = time.time() - ocr_start
             log.append(f"OCR completed in {float(ocr_duration):.2f} seconds")
+
+            # second pass only on a miss: inverted / low-contrast text (see _normalize_polarity)
+            low = text.lower()
+            if (phrases_lower and not all(p in low for p in phrases_lower)
+                    and not (error_lower and error_lower in low)):
+                if norm_future is not None:
+                    alt, norm_secs = norm_future.result()
+                    how = "in parallel"
+                else:
+                    alt, norm_secs = _normalized_ocr(img, scale_factor, ocr_config,
+                                                     screenshot_path + "_norm.png")
+                    how = "after the raw pass"
+                text = f"{text}\n--- polarity-normalized pass ---\n{alt}"
+                log.append(f"Normalized OCR pass completed in {float(norm_secs):.2f} seconds ({how})")
 
         except Exception as e:
             log.append(f"OCR failed on {png_path}: {str(e)}")
@@ -1252,25 +1647,34 @@ def ocr_word_find(instance, successphrase, numberofattempts=5, attemptdelay=2, s
         log.append(f"Total time this pass: {float(iter_total):.2f} seconds\n")
 
         text_lower = text.lower()
-        if phrase_lower is None:
-            return True, text, attempts, log, last_screenshot_path
-
-        if phrase_lower in text_lower:
-            return True, text, attempts, log, last_screenshot_path
 
         if error_lower and error_lower in text_lower:
             log.append(f"Aborted early: '{errorphrase}' found.")
             return False, text, attempts, log, last_screenshot_path
 
-        # Checks liveness once a second during the delay, so a dead emulator is noticed promptly.
+        blocking = [p for p, pl in zip(not_phrases, nots_lower) if pl in text_lower]
+        if blocking:
+            log.append(f"NOT phrase(s) {blocking} still on screen — retrying")
+        else:
+            if not phrases_lower:
+                return True, text, attempts, log, last_screenshot_path
+
+            missing = [p for p, pl in zip(success_phrases, phrases_lower) if pl not in text_lower]
+            if not missing:
+                return True, text, attempts, log, last_screenshot_path
+            if len(success_phrases) > 1:
+                log.append(f"still waiting for {missing}")
+
+        # check liveness each second
         deadline = time.time() + float(attemptdelay)
         while time.time() < deadline:
             if alive is not None and not alive():
                 break
+            if should_stop is not None and should_stop():
+                break
             time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
     return False, text, attempts, log, last_screenshot_path
-
 
 
 def make_disk_image(floppypath, size):
@@ -1288,17 +1692,15 @@ def make_disk_image(floppypath, size):
 
 DOS_BOOT_ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "disk_artifacts", "dos_boot_assets")
 
-# Standard floppy sizes (KB) mformat -f knows the geometry for.
+# standard floppy sizes (KB) mformat knows
 _STD_FLOPPY_KB = {160, 180, 320, 360, 720, 1200, 1440, 2880}
-# FAT12 tops out at 4084 clusters; FAT16 at 65524.
+# FAT12 max 4084 clusters; FAT16 max 65524
 _FAT12_MAX_CLUSTERS = 4084
 _FAT16_MAX_CLUSTERS = 65524
 
 
 def _pick_cluster_size(total_bytes, fat_bits):
-    """Pick a cluster size (in 512-byte sectors, a power of 2) that lands the
-    cluster count inside the requested FAT width's range. Returns an int, or
-    None to let mformat auto-decide."""
+    """Cluster size (512-byte sectors, power of 2) putting the cluster count in the FAT width's range; None lets mformat decide."""
     if fat_bits not in (12, 16):
         return None
     data_sectors = max(1, int(total_bytes) // 512)
@@ -1312,11 +1714,7 @@ def _pick_cluster_size(total_bytes, fat_bits):
 
 
 def _mtools_run(cmd, env=None, **kw):
-    """subprocess.run for an mtools command.
-
-    mtools prompts via /dev/tty directly, ignoring stdin=DEVNULL, so
-    start_new_session=True is used to deny it a controlling terminal.
-    """
+    """subprocess.run for an mtools command (start_new_session=True: mtools prompts via /dev/tty)."""
     kw.setdefault("stdout", subprocess.PIPE)
     kw.setdefault("stderr", subprocess.STDOUT)
     return subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL,
@@ -1338,14 +1736,11 @@ def _read_fat_type(path, offset=0):
 
 def create_disk_image(path, size_mb=None, size_kb=None, fat_bits=None, media="hdd",
                       bootable=False, label="", make_src_dir=False, overwrite=False):
-    """Create a new FAT disk image from scratch.
-
-    - media   : "hdd" (partitioned, offset 32256) or "floppy" (unpartitioned, offset 0)
-    - size_mb / size_kb : size (give one; floppies use size_kb, e.g. 1440)
-    - fat_bits: 12 or 16, or None to let mformat choose
-    - bootable: hdd only — delegates to create_fat_disk_image
-
-    Returns (success, message).
+    """Create a new FAT disk image from scratch -> (success, message).
+      media     "hdd" (partitioned, offset 32256) | "floppy" (unpartitioned, offset 0)
+      size_mb / size_kb   one of them (floppies size_kb, e.g. 1440)
+      fat_bits  12 | 16 | None (mformat chooses)
+      bootable  hdd only; delegates to create_fat_disk_image
     """
     media = str(media).strip().lower()
     if media not in ("hdd", "floppy"):
@@ -1357,7 +1752,6 @@ def create_disk_image(path, size_mb=None, size_kb=None, fat_bits=None, media="hd
     if fat_bits not in (None, 12, 16):
         return False, "fat_bits must be 12, 16, or None/auto"
 
-    # resolve size → bytes + a truncate size string
     if size_kb:
         total_bytes = int(size_kb) * 1024
         trunc = f"{int(size_kb)}K"
@@ -1373,7 +1767,7 @@ def create_disk_image(path, size_mb=None, size_kb=None, fat_bits=None, media="hd
     if os.path.exists(path) and not overwrite:
         return False, f"image already exists (pass overwrite=True to replace): {path}"
 
-    # Bootable HDD → the proven DOS-stamping path (ignores fat_bits; DOS picks it).
+    # bootable HDD: DOS-stamping path (DOS picks fat_bits)
     if bootable:
         if media != "hdd":
             return False, "bootable is only supported for hdd media"
@@ -1384,6 +1778,8 @@ def create_disk_image(path, size_mb=None, size_kb=None, fat_bits=None, media="hd
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     try:
+        # empty first: truncate -s keeps old bytes (stale files would match test_filecontains)
+        open(path, "wb").close()
         subprocess.check_call(["truncate", "-s", trunc, path])
     except (subprocess.CalledProcessError, OSError) as e:
         return False, f"truncate failed: {e}"
@@ -1418,7 +1814,7 @@ def create_disk_image(path, size_mb=None, size_kb=None, fat_bits=None, media="hd
             os.unlink(cfg.name)
         return True, _fmt_disk_msg("floppy", size_k, "K", fat_bits, actual, path)
 
-    # media == hdd, non-bootable: partitioned blank FAT
+    # non-bootable hdd: partitioned blank FAT
     ptype = "1" if fat_bits == 12 else ("6" if fat_bits == 16 else "6")
     cfg = tempfile.NamedTemporaryFile("w", delete=False, suffix=".mtoolsrc")
     cfg.write(f'drive p: file="{path}" partition=1\n')
@@ -1458,13 +1854,10 @@ def _fmt_disk_msg(media, size, unit, requested, actual, path):
 
 
 def create_fat_disk_image(path, size_mb, label="", make_src_dir=True, overwrite=False,
-                          system=True):
-    """Create an MS-DOS FAT disk image of size_mb megabytes, from scratch.
-
-    system=False builds a data-only disk (no MBR/IO.SYS/MSDOS.SYS/COMMAND.COM),
-    for a project's D: source drive. Otherwise writes DOS boot code and system
-    files from the bundled DOS_BOOT_ASSETS_DIR template. Creates an empty /src
-    directory by default. Returns (success, message).
+                          system=True, fat_bits=None):
+    """MS-DOS FAT disk image of size_mb MB from scratch -> (success, message).
+    fat_bits=None: mformat chooses (FAT12 below ~16MB); 12/16 forces it (cluster size picked, partition type 01 FAT12 | 04 FAT16 <32MB | 06 FAT16 >=32MB).
+    system=False: data-only disk (no MBR/IO.SYS/MSDOS.SYS/COMMAND.COM), for a D: source drive; otherwise boot code and system files from DOS_BOOT_ASSETS_DIR. Creates an empty /src by default.
     """
     try:
         size_mb = int(size_mb)
@@ -1486,17 +1879,22 @@ def create_fat_disk_image(path, size_mb, label="", make_src_dir=True, overwrite=
             return False, f"missing bundled DOS boot asset: {required}"
     with open(ptype_txt) as f:
         ptype = f.read().strip()
+    cluster = None
+    if fat_bits is not None:
+        if int(fat_bits) not in (12, 16):
+            return False, f"fat_bits must be 12 or 16, got {fat_bits!r}"
+        fat_bits = int(fat_bits)
+        cluster = _pick_cluster_size(size_mb * 1024 * 1024, fat_bits)
+        ptype = "1" if fat_bits == 12 else ("4" if size_mb < 32 else "6")
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     OFF = 32256
 
-    # 1) raw image of the requested size
     try:
         subprocess.check_call(["truncate", "-s", f"{size_mb}M", path])
     except (subprocess.CalledProcessError, OSError) as e:
         return False, f"truncate failed: {e}"
 
-    # 2) partition (at sector 63) + FAT format using the bundled boot sector
     pcfg = tempfile.NamedTemporaryFile("w", delete=False, suffix=".mtoolsrc")
     pcfg.write(f'drive p: file="{path}" partition=1\n')
     pcfg.close()
@@ -1506,7 +1904,8 @@ def create_fat_disk_image(path, size_mb, label="", make_src_dir=True, overwrite=
         steps = [
             ["mpartition", "-I", "p:"],
             ["mpartition", "-c", "-b", "63", "-T", ptype, "p:"],
-            ["mformat", "-B", bootsec_bin] + (["-v", label] if label else []) + ["p:"],
+            ["mformat", "-B", bootsec_bin] + (["-c", str(cluster)] if cluster else [])
+            + (["-v", label] if label else []) + ["p:"],
         ]
         for cmd in steps:
             r = _mtools_run(cmd, env=penv)
@@ -1516,19 +1915,17 @@ def create_fat_disk_image(path, size_mb, label="", make_src_dir=True, overwrite=
             if r.returncode != 0:
                 return False, f"{' '.join(cmd)} failed:\n" + "\n".join(log)
 
-        # 3) MBR boot code (bytes 0-445) from the bundled template, then mark active.
         if system:
             subprocess.run(["dd", f"if={mbr_bin}", f"of={path}", "bs=446",
                             "count=1", "conv=notrunc", "status=none"], check=True)
             _mtools_run(["mpartition", "-a", "p:"], env=penv)
 
-        # BPB hidden-sectors must equal the partition LBA (63); mformat writes 0,
-        # which makes the DOS boot code look in the wrong place for IO.SYS.
+        # BPB hidden-sectors = partition LBA (63)
         with open(path, "r+b") as f:
             f.seek(OFF + 0x1C)
             f.write((63).to_bytes(4, "little"))
 
-        # 4) DOS system files, IO.SYS/MSDOS.SYS first (must land at cluster 2).
+        # DOS system files: IO.SYS/MSDOS.SYS first (cluster 2)
         dcfg = tempfile.NamedTemporaryFile("w", delete=False, suffix=".mtoolsrc")
         dcfg.write(f'drive d: file="{path}" offset={OFF}\n')
         dcfg.close()
@@ -1554,14 +1951,7 @@ def create_fat_disk_image(path, size_mb, label="", make_src_dir=True, overwrite=
 
 
 def clone_disk_image(src_path, dst_path, size_mb=None, overwrite=False):
-    """Clone a disk image to dst_path.
-
-    - size_mb None or == source size: exact byte copy.
-    - size_mb larger: new blank FAT image, files copied in (not bootable).
-    - size_mb smaller: refused.
-
-    Returns (success, message).
-    """
+    """Clone a disk image to dst_path -> (success, message). size_mb None or equal: exact byte copy; larger: new blank FAT image with files copied (not bootable); smaller: refused."""
     src_path = os.path.abspath(str(src_path))
     dst_path = os.path.abspath(str(dst_path))
     if not os.path.isfile(src_path):
@@ -1580,12 +1970,11 @@ def clone_disk_image(src_path, dst_path, size_mb=None, overwrite=False):
     if size_mb < src_mb:
         return False, f"target {size_mb}MB < source {src_mb}MB (shrink not supported)"
 
-    # Bootable grow: if the source is a bootable DOS disk (has IO.SYS), rebuild
-    # it larger while keeping it bootable (fatresize can't grow FAT12/FAT).
+    # bootable source: rebuild larger, stay bootable (fatresize can't grow FAT12)
     if _has_dos_system(src_path):
         return build_bootable_dos_image(src_path, dst_path, size_mb, overwrite=True)
 
-    # Otherwise (plain data disk): fresh blank FAT + file-level copy (not bootable).
+    # data disk: fresh blank FAT + file copy
     ok, msg = create_fat_disk_image(dst_path, size_mb, make_src_dir=False, overwrite=True)
     if not ok:
         return False, f"could not create target image: {msg}"
@@ -1598,7 +1987,7 @@ def clone_disk_image(src_path, dst_path, size_mb=None, overwrite=False):
 
     scfg, dcfg = _cfg(src_path, "s"), _cfg(dst_path, "d")
     try:
-        # Merge both drive configs so mcopy can see s: and d: at once.
+        # merge drive configs so mcopy sees s: and d:
         merged = tempfile.NamedTemporaryFile("w", delete=False, suffix=".mtoolsrc")
         merged.write(open(scfg).read())
         merged.write(open(dcfg).read())
@@ -1633,13 +2022,7 @@ def _has_dos_system(img_path, offset=32256):
 
 
 def build_bootable_dos_image(template_src, dst_path, size_mb, overwrite=False):
-    """Build a bootable MS-DOS hard-disk image of size_mb MB, reusing an
-    existing bootable DOS template's boot code and system files.
-
-    Produces a partitioned FAT disk with the template's boot sector, MBR,
-    active partition, IO.SYS/MSDOS.SYS placed first, and every other file
-    copied in. Returns (success, message).
-    """
+    """Bootable MS-DOS hard-disk image of size_mb MB from an existing bootable DOS template (boot sector, MBR, active partition, IO.SYS/MSDOS.SYS first, other files copied) -> (success, message)."""
     template_src = os.path.abspath(str(template_src))
     dst_path = os.path.abspath(str(dst_path))
     OFF = 32256
@@ -1669,12 +2052,10 @@ def build_bootable_dos_image(template_src, dst_path, size_mb, overwrite=False):
         _mtools_run(["mpartition", "-I", "p:"], env=penv, check=True)
         _mtools_run(["mpartition", "-c", "-b", "63", "-T", str(ptype), "p:"], env=penv, check=True)
         _mtools_run(["mformat", "-B", bootsec, "p:"], env=penv, check=True)
-        # MBR boot code (bytes 0-445) from the template, then mark active.
         subprocess.run(["dd", f"if={template_src}", f"of={dst_path}", "bs=446",
                         "count=1", "conv=notrunc", "status=none"], check=True)
         _mtools_run(["mpartition", "-a", "p:"], env=penv)
-        # BPB hidden-sectors must equal the partition LBA (63); mformat writes 0,
-        # which makes the DOS boot code look in the wrong place for IO.SYS.
+        # BPB hidden-sectors = partition LBA (63)
         with open(dst_path, "r+b") as f:
             f.seek(OFF + 0x1C)
             f.write((63).to_bytes(4, "little"))
@@ -1685,11 +2066,11 @@ def build_bootable_dos_image(template_src, dst_path, size_mb, overwrite=False):
         scfg.close()
         senv = {**os.environ, "MTOOLSRC": scfg.name}
         try:
-            # IO.SYS + MSDOS.SYS first (must land at cluster 2), with sys attrs.
+            # IO.SYS + MSDOS.SYS first (cluster 2), sys attrs
             _mtools_run(["mcopy", "-n", "s:/IO.SYS", "d:/IO.SYS"], env=senv)
             _mtools_run(["mcopy", "-n", "s:/MSDOS.SYS", "d:/MSDOS.SYS"], env=senv)
             _mtools_run(["mattrib", "+s", "+h", "+r", "d:/IO.SYS", "d:/MSDOS.SYS"], env=senv)
-            # every other top-level entry (files + dirs), skipping the two above
+            # other top-level entries
             listing = _mtools_run(["mdir", "-a", "-b", "s:/"], env=senv)
             for line in listing.stdout.decode("utf-8", "replace").splitlines():
                 base = os.path.basename(line.strip().rstrip("/"))
@@ -1712,9 +2093,7 @@ def build_bootable_dos_image(template_src, dst_path, size_mb, overwrite=False):
 
 
 def overlay_backing_file(overlay_path):
-    """Return the backing (template) file recorded inside a QCOW2 overlay,
-    or None if it isn't a qcow2 / has no backing file.
-    """
+    """Backing (template) file recorded in a QCOW2 overlay, or None."""
     try:
         result = subprocess.run(
             ["qemu-img", "info", "--output=json", str(overlay_path)],
@@ -1727,8 +2106,7 @@ def overlay_backing_file(overlay_path):
 
 
 def image_format(image_path):
-    """The disk format qemu-img detects for `image_path` ("raw", "qcow2", ...),
-    or None if it can't be read."""
+    """Disk format qemu-img detects ("raw", "qcow2", ...), or None."""
     try:
         result = subprocess.run(
             ["qemu-img", "info", "--output=json", str(image_path)],
@@ -1739,12 +2117,7 @@ def image_format(image_path):
 
 
 def create_overlay_image(template_path, overlay_path, overwrite=True):
-    """Create a QCOW2 copy-on-write overlay backed by a read-only raw template.
-
-    The template (in /testsrc/templates, chmod 444) must never change once
-    overlays exist. The overlay is recreated from scratch each run. Returns
-    (success, msg).
-    """
+    """QCOW2 copy-on-write overlay backed by a read-only raw template (/testsrc/templates, chmod 444), recreated each run -> (success, msg)."""
     template_path = os.path.abspath(str(template_path))
     overlay_path = os.path.abspath(str(overlay_path))
 
@@ -1759,7 +2132,7 @@ def create_overlay_image(template_path, overlay_path, overwrite=True):
             return False, f"could not remove stale overlay {overlay_path}: {e}"
 
     os.makedirs(os.path.dirname(overlay_path) or ".", exist_ok=True)
-    # -F must state the template's real format, or a qcow2 template read as raw silently corrupts.
+    # -F states the template's real format (qcow2 vs raw)
     backing_fmt = image_format(template_path) or "raw"
     try:
         result = subprocess.run(
@@ -1798,14 +2171,12 @@ def convert_raw_to_qcow2(hdd_img_path, qcow2_output):
 
 
 def convert_qcow2_to_raw(qcow2_path, raw_output):
-    """Flatten a QCOW2 overlay and its backing chain into one raw image, for
-    emulators (DOSBox-X, 86Box) that can't read QCOW2. Returns (success, msg).
-    """
+    """Flatten a QCOW2 overlay and its backing chain into one raw image (for DOSBox-X, 86Box) -> (success, msg)."""
     if not os.path.isfile(qcow2_path):
         return False, f"[error] QCOW2 image not found: {qcow2_path}"
 
     os.makedirs(os.path.dirname(os.path.abspath(raw_output)) or ".", exist_ok=True)
-    # Removed rather than overwritten, so a bigger previous image's tail can't linger.
+    # remove, not overwrite: no stale tail
     if os.path.exists(raw_output):
         try:
             os.unlink(raw_output)
@@ -1826,16 +2197,17 @@ def convert_qcow2_to_raw(qcow2_path, raw_output):
         return False, f"qemu-img convert failed: {output}"
 
 
-def copy_to_fat_image(src_dir, hdd_img_path, dest_dir="src"):
+def copy_to_fat_image(src_dir, hdd_img_path, dest_dir="src", offset=32256):
+    """offset: 32256 for a partitioned HDD image, 0 for an unpartitioned floppy."""
     log = []
     dest_dir = str(dest_dir).strip("/")
-    mtools_config = f'drive h: file="{hdd_img_path}" offset=32256\n'
+    mtools_config = f'drive h: file="{hdd_img_path}" offset={int(offset)}\n'
     with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
         tmp.write(mtools_config)
         config_path = tmp.name
 
     try:
-        # start_new_session=True denies mmd a controlling terminal so its dev/tty prompt can't block forever.
+        # start_new_session: mmd gets no controlling terminal
         t0 = time.time()
         try:
             r = subprocess.run(
@@ -1899,7 +2271,7 @@ def copy_from_fat_image(src_dos_dir, dst_dir, image_path):
                 check=True,
                 executable="/bin/bash",
                 stdin=subprocess.DEVNULL,
-                # Prevents an overwrite prompt from hanging forever (no timeout backstop here).
+                # avoid an overwrite prompt hang
                 start_new_session=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1924,7 +2296,6 @@ def find_button_in_screenshot(button_path, screenshot_path):
     full_img = Image.open(screenshot_path).convert("L")
     button_img = Image.open(button_path).convert("L")
 
-    # Saved for inspection.
     full_converted_path = os.path.splitext(screenshot_path)[0] + "_converted.png"
     button_converted_path = os.path.splitext(button_path)[0] + "_converted.png"
     full_img.save(full_converted_path)
@@ -1940,7 +2311,7 @@ def find_button_in_screenshot(button_path, screenshot_path):
         for x in range(fw - bw + 1):
             patch = full_arr[y:y+bh, x:x+bw]
             if (patch == button_arr).all():
-                # Centre of the match, not top-left, so it lands on the clickable hotspot.
+                # centre of the match = clickable hotspot
                 return True, (x + bw // 2, y + bh // 2)
 
     return False, "Button not found"
@@ -1948,18 +2319,11 @@ def find_button_in_screenshot(button_path, screenshot_path):
 
 def find_icon_in_screenshot(icon_path, screenshot_path, tolerance=0.12,
                             pixel_delta=48, mask_path=None, region=None):
-    """Tolerant template match, for Finder icons whose background dithering
-    breaks an exact match (see find_button_in_screenshot).
-
-    Scores each candidate position by the fraction of template pixels that
-    differ from the frame by more than `pixel_delta`, and accepts the best
-    position when that fraction is <= `tolerance`.
-
+    """Tolerant template match for Finder icons (dithered backgrounds). Accepts the best position when the fraction of template pixels differing by more than `pixel_delta` is <= `tolerance`.
       tolerance   max fraction of (unmasked) pixels allowed to mismatch
       pixel_delta per-pixel grayscale difference that counts as "different"
-      mask_path   optional PNG; pixels that are black (<128) are ignored
+      mask_path   optional PNG; black (<128) pixels ignored
       region      optional (x0, y0, x1, y1) search box in frame pixels
-
     Returns (True, (cx, cy)) at the glyph centre, or (False, reason).
     """
     from numpy.lib.stride_tricks import sliding_window_view
@@ -1971,14 +2335,14 @@ def find_icon_in_screenshot(icon_path, screenshot_path, tolerance=0.12,
 
     if mask_path:
         m = np.array(Image.open(mask_path).convert("L"))
-        mask = (m >= 128)                       # True = compare this pixel
+        mask = (m >= 128)
     else:
         mask = np.ones((bh, bw), dtype=bool)
     n_cmp = int(mask.sum())
     if n_cmp == 0:
         return False, "icon mask is empty (nothing to compare)"
 
-    # Clamps the search to an ROI so the sliding-window array stays small at higher resolutions.
+    # clamp search to an ROI
     x0, y0, x1, y1 = (0, 0, fw, fh) if region is None else region
     x0 = max(0, int(x0)); y0 = max(0, int(y0))
     x1 = min(fw, int(x1)); y1 = min(fh, int(y1))
@@ -2021,7 +2385,7 @@ def ppdcompile(sock):
 
     return False
 
-# Live QEMU control (merged from former qemuctlhelpers.py).
+# live QEMU control
 """Live QEMU control — see what's running and swap removable media on it.
 
 Finds running qemu-system-* processes by scanning /proc, and drives their
@@ -2039,13 +2403,13 @@ _TESTSRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCEDIR = os.path.join(_TESTSRC_ROOT, "sourcedir")
 IMAGES_ROOT = os.path.join(_TESTSRC_ROOT, "images")
 
-# Media may only come from the project tree or the media library.
+# media only from the project tree or media library
 ALLOWED_ROOTS = (SOURCEDIR, IMAGES_ROOT)
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\[K|\r")
 _MONITOR_RE = re.compile(r"tcp:(?:127\.0\.0\.1|localhost):(\d+)")
 
-# 2.88MB, the largest standard floppy; matches mediahelpers's definition.
+# 2.88MB largest standard floppy (as mediahelpers)
 _MAX_FLOPPY_BYTES = 2949120
 _ISO_EXTS = (".iso", ".cdr")
 
@@ -2074,7 +2438,7 @@ def _slot_kind(device):
     return "other"
 
 
-# Media kinds each slot type accepts.
+# media kinds per slot type
 _SLOT_ACCEPTS = {
     "floppy": ["floppy"],
     "cdrom":  ["iso"],
@@ -2094,8 +2458,7 @@ def _drive_label(device, slot_kind):
     return ""
 
 
-# ── QMP ───────────────────────────────────────────────────────────────────────
-# Preferred channel: the HMP monitor is single-client and owned by the runner's QemuInstance for the whole run.
+# QMP: HMP monitor is owned by the runner's QemuInstance
 
 class _QMP:
     def __init__(self, port, timeout=3.0):
@@ -2111,7 +2474,7 @@ class _QMP:
         greeting = self._read()
         if not greeting or "QMP" not in greeting:
             raise OSError(f"port {self.port} is not a QMP monitor")
-        # Required before any other command is accepted.
+        # capabilities negotiation (required first)
         r = self.execute("qmp_capabilities")
         if "error" in r:
             raise OSError(f"qmp_capabilities failed: {r['error'].get('desc')}")
@@ -2141,7 +2504,7 @@ class _QMP:
             msg["arguments"] = arguments
         self.fh.write((json.dumps(msg) + "\n").encode())
         self.fh.flush()
-        # Skips async events (RESET, DEVICE_TRAY_MOVED...) until this command's return/error.
+        # skip async events until this command's return/error
         deadline = time.time() + self.timeout + 2
         while time.time() < deadline:
             m = self._read()
@@ -2152,7 +2515,7 @@ class _QMP:
             if "return" in m or "error" in m:
                 return m
         return {"error": {"desc": f"no reply to '{cmd}'"}}
-# "floppy0 (#block186): /path/img (raw)"  |  "ide1-cd0: [not inserted]"
+# parses: "floppy0 (#block186): /path/img (raw)" | "ide1-cd0: [not inserted]"
 _BLOCK_RE = re.compile(r"^(\S+?)(?: \(#block\d+\))?: (.*)$")
 
 
@@ -2165,15 +2528,13 @@ def _read_cmdline(pid):
 
 
 def _proc_start_epoch(pid):
-    """Wall-clock start time of a process, from /proc/<pid>/stat field 22
-    offset against /proc/uptime. Returns None if it can't be read.
-    """
+    """Process start time (wall clock) from /proc/<pid>/stat field 22 and /proc/uptime; None if unreadable."""
     try:
         with open(f"/proc/{pid}/stat") as f:
             data = f.read()
-        # Indexes past comm's closing paren, since comm may contain spaces/parens.
+        # index past comm's closing paren (may contain spaces/parens)
         fields = data[data.rindex(")") + 2:].split()
-        starttime_ticks = int(fields[19])          # field 22 overall
+        starttime_ticks = int(fields[19])
         hz = os.sysconf("SC_CLK_TCK") or 100
         with open("/proc/uptime") as f:
             sys_uptime = float(f.read().split()[0])
@@ -2211,7 +2572,7 @@ def list_instances():
             if mm:
                 vnc = 5900 + int(mm.group(1))
 
-        # Labels by the project its disks live in, falling back to the arch.
+        # label by project, else arch
         label = None
         for a in args:
             m = re.search(re.escape(SOURCEDIR) + r"/([^/]+)/", a)
@@ -2229,7 +2590,7 @@ def list_instances():
             "label": label or binary.replace("qemu-system-", ""),
             "started": started,
             "uptime_s": int(time.time() - started) if started else None,
-            # An HMP-only VM is controllable only if its single monitor connection is free.
+            # HMP-only VM is controllable only if its monitor connection is free
             "channel": "qmp" if qmp_port else ("hmp" if port else None),
             "controllable": bool(qmp_port or port),
             "cmdline": joined,
@@ -2251,11 +2612,7 @@ def _hmp_is_error(text):
 
 
 def _hmp_via_qmp(qmp_port, cmd):
-    """Run an HMP command through the QMP channel (`human-monitor-command`).
-
-    Lets HMP-only features work on a runner-launched VM, whose real HMP
-    socket is already held by the runner. Returns (ok, text).
-    """
+    """HMP command via QMP `human-monitor-command` (for runner-launched VMs whose HMP socket the runner holds) -> (ok, text)."""
     try:
         with _QMP(qmp_port) as q:
             r = q.execute("human-monitor-command", {"command-line": cmd})
@@ -2268,13 +2625,7 @@ def _hmp_via_qmp(qmp_port, cmd):
 
 
 def _hmp(port, cmd, timeout=3.0):
-    """Send one HMP command directly to the monitor socket and return (ok, reply).
-
-    Drops the keystroke echo before the first newline. Requires QEMU's
-    greeting banner before trusting the reply, since the monitor serves only
-    one client and a second connection can hang silently with no banner.
-    Prefer _hmp_via_qmp where a QMP port exists.
-    """
+    """One HMP command directly on the monitor socket -> (ok, reply). Drops the keystroke echo; requires QEMU's greeting banner first (single client). Prefer _hmp_via_qmp where a QMP port exists."""
     try:
         s = socket.create_connection(("127.0.0.1", int(port)), timeout=timeout)
     except (OSError, ValueError) as e:
@@ -2283,7 +2634,7 @@ def _hmp(port, cmd, timeout=3.0):
         s.settimeout(1.2)
         time.sleep(0.25)
         banner = b""
-        try:                       # the banner also proves the socket is serviced
+        try:
             banner = s.recv(65536)
         except socket.timeout:
             pass
@@ -2348,9 +2699,7 @@ def _qmp_blocks(qmp_port):
 
 
 def list_blocks(pid=None, port=None, qmp_port=None):
-    """Drive slots of a running guest, preferring QMP. Accepts a pid (looked
-    up) or explicit ports. Removable slots are marked. Returns (ok, list|msg).
-    """
+    """Drive slots of a running guest (QMP preferred); a pid or explicit ports; removable slots marked -> (ok, list|msg)."""
     if pid is not None:
         inst = _find(pid)
         if not inst:
@@ -2409,14 +2758,7 @@ def _media_image_format(path):
 
 
 def attach_media(pid, device, path, read_only=None):
-    """Insert an image into a running guest's removable drive.
-
-    read_only: None auto-detects from file permissions; True/False forces the
-    mode (False fails on an unwritable file rather than silently downgrading).
-
-    Uses QMP blockdev-change-medium when available, else HMP `change`.
-    Returns (ok, message).
-    """
+    """Insert an image into a running guest's removable drive -> (ok, message). read_only: None auto-detects from permissions; True/False forces (False fails on an unwritable file). QMP blockdev-change-medium, else HMP `change`."""
     ap, err = _check_path(path)
     if err:
         return False, err
@@ -2438,7 +2780,7 @@ def attach_media(pid, device, path, read_only=None):
         return False, (f"'{device}' is not removable — a guest won't see a hot-swapped "
                        f"hard disk without a reboot. Use a floppy or cdrom slot.")
 
-    # Matches media to slot: iso belongs in a cdrom, floppy .img in a floppy drive.
+    # iso -> cdrom, floppy .img -> floppy drive
     mk = media_kind_for_path(ap)
     accepts = match.get("accepts") or ["floppy", "iso"]
     if mk not in accepts:
@@ -2448,7 +2790,7 @@ def attach_media(pid, device, path, read_only=None):
                        f"'{device}' takes {want}. Put an ISO in a cdrom and a floppy "
                        f"image in a floppy drive.")
 
-    # Auto-mounts an unwritable floppy image read-only instead of erroring on QEMU's write lock.
+    # unwritable floppy image: mount read-only
     writable = os.access(ap, os.W_OK)
     if read_only is None:
         read_only = not writable
@@ -2459,7 +2801,7 @@ def attach_media(pid, device, path, read_only=None):
             f"{oct(os.stat(ap).st_mode)[-3:]}). Make it writable on the host — "
             f"chown it to uid {os.getuid()} or chmod a+w — then attach again.")
     fmt = _media_image_format(ap)
-    # Always states the mode explicitly, since read-only-mode defaults to "retain" and would stick.
+    # state read-only-mode explicitly (default "retain" sticks)
     mode = "read-only" if read_only else "read-write"
     if inst["qmp_port"]:
         try:
@@ -2480,9 +2822,7 @@ def attach_media(pid, device, path, read_only=None):
 
 
 def detach_media(pid, device, force=False):
-    """Eject whatever is in a removable drive. Not forced by default, since a
-    locked tray usually means a mid-write guest. Returns (ok, message).
-    """
+    """Eject a removable drive (not forced by default) -> (ok, message)."""
     device = str(device).strip()
     if not device or '"' in device:
         return False, "invalid device name"
@@ -2512,18 +2852,12 @@ def detach_media(pid, device, force=False):
     return True, f"Ejected {device}"
 
 
-# ── Boot order ──────────────────────────────────────────────────────────────
-# boot_set has no QMP equivalent, so it always goes over the HMP monitor.
+# boot_set is HMP-only
 _BOOT_LETTER = {"floppy": "a", "disk": "c", "cdrom": "d"}
 
 
 def set_boot_priority(pid, prefer_floppy):
-    """Reorder the BIOS boot device list for a running instance.
-
-    `prefer_floppy=True` puts the floppy first; False restores hard-disk-first.
-    Takes effect on the next boot/reset only — see reset_instance.
-    Returns (ok, message).
-    """
+    """Reorder the BIOS boot device list of a running instance: prefer_floppy=True floppy first, False hard-disk first. Takes effect on next boot/reset (reset_instance) -> (ok, message)."""
     inst = _find(pid)
     if not inst:
         return False, f"no running QEMU with pid {pid}"
@@ -2538,7 +2872,7 @@ def set_boot_priority(pid, prefer_floppy):
     order = (["floppy", "disk", "cdrom"] if prefer_floppy else ["disk", "floppy", "cdrom"])
     letters = "".join(_BOOT_LETTER[k] for k in order if k in present)
 
-    # Prefers QMP, since the raw HMP socket is almost always already owned by the runner.
+    # prefer QMP (HMP socket owned by the runner)
     if inst.get("qmp_port"):
         ok, reply = _hmp_via_qmp(inst["qmp_port"], f"boot_set {letters}")
     else:
@@ -2551,9 +2885,7 @@ def set_boot_priority(pid, prefer_floppy):
 
 
 def reset_instance(pid):
-    """Reboot a running guest (destructive). Prefers QMP `system_reset`,
-    falls back to HMP for a pre-QMP instance. Returns (ok, message).
-    """
+    """Reboot a running guest (destructive): QMP `system_reset`, else HMP -> (ok, message)."""
     inst = _find(pid)
     if not inst:
         return False, f"no running QEMU with pid {pid}"

@@ -1,16 +1,4 @@
-"""Which X display an emulator window should open on.
-
-Non-headless runs are for the user to watch: the emulator has to appear on the
-same X session app.py is running in -- the xfce/RDP desktop reachable on port
-33891 -- not on a private Xvfb the user can't see. app.py inherits that display
-(currently ":20.0", from xorgxrdp), so helpers running inside the runner just
-need to honour os.environ["DISPLAY"].
-
-The fallback only matters when a helper is exercised from a bare shell with no
-DISPLAY set. Hardcoding one (basiliskhelpers pins ":14") goes stale as soon as
-the RDP session is recycled -- /tmp/.X11-unix is full of dead sockets from old
-sessions -- so find the live xrdp X server instead.
-"""
+"""Which X display an emulator window opens on: the xfce/RDP session app.py runs in (os.environ["DISPLAY"], else the live xrdp session found here)."""
 
 import os
 import re
@@ -18,10 +6,7 @@ import subprocess
 
 
 def resolve_display(explicit=None):
-    """Return the display emulator windows should open on.
-
-    explicit wins; then the ambient DISPLAY; then the running xrdp session.
-    """
+    """Display for emulator windows: explicit, else ambient DISPLAY, else the running xrdp session."""
     if explicit:
         return explicit
     if os.environ.get("DISPLAY"):
@@ -30,11 +15,7 @@ def resolve_display(explicit=None):
 
 
 def find_rdp_display():
-    """Find the live xorgxrdp session's display, e.g. ':20'.
-
-    Prefers an Xorg started with an xrdp config; falls back to the
-    highest-numbered live Xorg. Returns None if nothing is running.
-    """
+    """Live xorgxrdp session display, e.g. ':20' (Xorg with an xrdp config, else highest-numbered live Xorg); None if none."""
     try:
         ps = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
     except Exception:
@@ -48,7 +29,6 @@ def find_rdp_display():
         if not m:
             continue
         disp = m.group(1)
-        # xorgxrdp sessions carry an xrdp-ish config/logfile on the cmdline.
         is_rdp = "xrdp" in line or "xorg.conf" in line
         candidates.append((is_rdp, int(disp[1:]), disp))
 

@@ -1,0 +1,1004 @@
+import time
+import os, sys
+import struct
+import subprocess
+import socket
+import threading
+import signal
+try:                                  # optional OCR/QR deps; absent on the Windows runner
+    import pytesseract
+except ImportError:
+    pytesseract = None
+import re
+from PIL import Image
+
+import os
+from PIL import Image
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+try:                                  # optional (QR decode); absent on the Windows runner
+    from pyzbar.pyzbar import decode
+except ImportError:
+    decode = None
+import os
+from PIL import Image, ImageOps
+from appstate import process_registry
+
+
+
+
+VICE_BASE_PORT = 65501
+assigned_window_ids = set()
+
+
+# base_dir = os.path.dirname(os.path.abspath(__file__))
+base_dir = "/testsrc/"
+
+
+
+
+
+def ascii_to_petscii_c128(ascii_str, addr_start=0x0352):
+    petscii_bytes = []
+    for ch in ascii_str:
+        if 'a' <= ch <= 'z':
+            petscii_bytes.append(ord(ch) - 0x20)
+        else:
+            petscii_bytes.append(ord(ch))
+            
+    petscii_bytes = petscii_bytes[:10]
+    byte_strs = ["{:02X}".format(b) for b in petscii_bytes]
+    cmd = "> {:04X} {}".format(addr_start, " ".join(byte_strs))
+    return cmd
+
+
+def send_c128_command(context, name, cmd_str):
+    lines = cmd_str.splitlines()
+    for line in lines:
+        clean_line = line.lower()
+        if not clean_line:
+            continue
+        
+        monitor_cmd = 'keybuf ' + clean_line + '\\x0d'
+        
+        send_single_C128command(context, name, monitor_cmd)
+    return True, "Sent all lines"
+
+
+def send_single_C128command(context, name, cmd_str):
+    instance = context.get(name)
+    port = instance.port
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        payload = cmd_str.encode('ascii') + b'\n\r'
+        sock.sendall(payload)
+        sock.shutdown(socket.SHUT_WR)
+        response = b""
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            response += data
+        return response.decode(errors='ignore')
+
+
+def send_single_command(context, name, cmd_str):
+    if not isinstance(cmd_str, str):
+        raise TypeError(f"cmd_str must be a string, got {type(cmd_str)}: {cmd_str}")
+
+    instance = context.get(name)
+    if not isinstance(instance, ViceInstance):
+        raise ValueError(f"No ViceInstance named '{name}' in context")
+
+    port = instance.port
+    print(f"Connecting to VICE '{name}' on port {port} to send: {cmd_str.strip()}")
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.sendall((cmd_str + "\n").encode('ascii'))
+        sock.shutdown(socket.SHUT_WR)
+        response = b""
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            response += data
+        print(f"VICE '{name}' response:\n", response.decode(errors='ignore'))
+        return response.decode(errors='ignore')
+    
+
+def ascii_to_petscii_cmd(ascii_str, addr_start=0x0277):
+    petscii_bytes = []
+    for ch in ascii_str:
+        if 'a' <= ch <= 'z':
+            ch = ch.upper()
+        petscii_bytes.append(ord(ch))
+
+    addr_end = addr_start + len(petscii_bytes) - 1
+    byte_strs = ["{:02X}".format(b) for b in petscii_bytes]
+
+    cmd = "f {:04X} {:04X} {}".format(addr_start, addr_end, " ".join(byte_strs))
+    return cmd
+
+
+def wait_for_port(host, port, timeout=10):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except:
+            time.sleep(0.1)
+    return False
+
+
+# Keyboard buffer (KEYD) and its length byte (NDX) per machine. The C64 and
+# VIC-20 KERNALs share the same locations; the C128 and PET move both.
+KEYBOARD_BUFFERS = {
+    "c64":   (0x0277, 0x00C6),
+    "vic20": (0x0277, 0x00C6),
+    "c128":  (0x034A, 0x00D0),
+    "pet":   (0x026F, 0x009E),
+}
+
+
+def keyboard_buffer_for(context, name):
+    """KEYD/NDX addresses for the machine context[name] is emulating."""
+    instance = context.get(name)
+    archtype = getattr(instance, "archtype", None)
+    return KEYBOARD_BUFFERS.get(archtype, KEYBOARD_BUFFERS["c64"])
+
+
+def send_vice_command(context, name, string):
+    # keyboard input; buffer location follows the emulated machine
+    string = string.replace('\n', '\r')
+    i = 0
+    log = []
+    keyd_addr, ndx_addr = keyboard_buffer_for(context, name)
+
+    while i < len(string):
+        chunk = string[i:i + 10]
+        print(f"Sending to '{name}':", chunk)
+        bits = ascii_to_petscii_cmd(chunk, addr_start=keyd_addr)
+        # Fill the keyboard buffer (KEYD=$0277) then set its length (NDX=$00C6)
+        # exactly once. Re-arming NDX a second time re-reads stale/NUL bytes
+        # left in KEYD after a fast (warp-mode) program already drained it,
+        # which injects phantom keystrokes — visible as trailing NULs/'@'.
+        log.append(send_single_command(context, name, bits))
+        log.append(send_single_command(context, name, f"f {ndx_addr:04X} {ndx_addr:04X} {len(chunk):02X}"))
+
+        i += 10
+
+    return True, "\n".join(log)
+
+
+def send_cbmpet_text(context, name, string):
+    string = string.replace('\n', '\r')
+    i = 0
+    log = []
+    
+    buffer_addr = 0x026F
+    count_addr = 0x009E
+    while i < len(string):
+        chunk = string[i:i + 10]
+        length = len(chunk)
+        hex_values = " ".join([f"{ord(c):02X}" for c in chunk])
+        log.append(send_single_command(context, name, "stop"))
+        log.append(send_single_command(context, name, f"f {buffer_addr:04X} {buffer_addr + length - 1:04X} {hex_values}"))
+        log.append(send_single_command(context, name, f"f {count_addr:04X} {count_addr:04X} {length:02X}"))
+        log.append(send_single_command(context, name, "x"))
+        i += 10
+
+    return True, "\n".join(log)
+
+
+def next_vice_instance(context):
+    if "_vice_count" not in context:
+        context["_vice_count"] = 0
+
+    index = context["_vice_count"]
+    context["_vice_count"] += 1
+
+    name = f"vice{index + 1}"
+    port = VICE_BASE_PORT + index
+
+    return name, port
+
+
+def find_window_id_by_pid(pid):
+    try:
+        result = subprocess.check_output(["xdotool", "search", "--pid", str(pid)])
+        for line in result.decode().splitlines():
+            wid = line.strip()
+            try:
+                title = subprocess.check_output(["xdotool", "getwindowname", wid]).decode().strip()
+                if "VICE" in title or "C64" in title:
+                    return wid
+            except subprocess.CalledProcessError:
+                continue
+    except subprocess.CalledProcessError:
+        return None
+    return None
+
+# wrapper for putting logging around class start method
+def launch_vice_instance(instance, boot_delay=3):
+    log = []
+    log.append(f"Launching {instance.name} on port {instance.port} with disk={instance.disk8_path}")
+    
+    if not instance.start():
+        log.append(f"{instance.name} failed to start (no window ID detected).")
+        return False, log
+
+    time.sleep(boot_delay)
+
+    if not instance.wait_for_ready():
+        log.append(f"{instance.name} did not become ready on port {instance.port}")
+        log.append(f"{instance.name} stdout:\n{''.join(instance.get_output())}")
+        return False, log
+
+    log.append(f"{instance.name} is ready")
+    log.append(f"{instance.name} stdout:\n{''.join(instance.get_output())}")
+    return True, log
+
+
+class ViceInstance:
+    def __init__(self, name, port, archtype, config_path=None, disk8_path=None, disk9_path=None, tape_path=None, rom_path=None, autostart_path=None, warpmode=None, binmon_port=None, emubin=None):
+        #base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = "/testsrc/"
+        self.name = name
+        self.port = port
+        self.binmon_port = binmon_port
+        self.archtype = archtype
+        # Optional override for the emulator binary, e.g. "x64sc" instead of the
+        # default "x64". x64 does not model VIC-II badline cycle stealing, so a
+        # test that measures CPU load or does $D418 sample playback needs the
+        # cycle-exact build. Left unset, the archtype default below applies.
+        self.emubin = emubin.strip() if isinstance(emubin, str) and emubin.strip() and emubin.strip().lower() not in ("none", "null") else None
+        self.config_path = os.path.join(base_dir, config_path) if config_path and not os.path.isabs(config_path) else config_path
+        self.disk8_path = os.path.join(base_dir, disk8_path) if disk8_path and not os.path.isabs(disk8_path) else disk8_path
+        self.disk9_path = os.path.join(base_dir, disk9_path) if disk9_path and not os.path.isabs(disk9_path) else disk9_path
+        # .tap image for datasette #1; needs to stay writable so the emulated
+        # SAVE can grow it.
+        self.tape_path = os.path.join(base_dir, tape_path) if tape_path and not os.path.isabs(tape_path) else tape_path
+        self.autostart_path = os.path.join(base_dir, autostart_path) if autostart_path and not os.path.isabs(autostart_path) else autostart_path
+        self.window_id = None
+        self.screenshot_count = 0
+        self.rom_path = os.path.join(base_dir, rom_path) if rom_path and not os.path.isabs(rom_path) else rom_path
+        self.proc = None
+        self.thread = None
+        self.ready_event = threading.Event()
+        self._output_lock = threading.Lock()
+        self._output_lines = []
+        self._stop_reading = threading.Event()
+        self.window_id_40 = None 
+        self.window_id_80 = None
+        self.warpmode = warpmode
+        
+
+    seen_window_ids = set()
+
+    def get_output(self):
+        with self._output_lock:
+            return list(self._output_lines)
+
+
+    def _reader(self):
+        with self.proc.stdout:
+            for line in iter(self.proc.stdout.readline, ''):
+                with self._output_lock:
+                    self._output_lines.append(line)
+                # print realtime output
+                # print(f"[{self.name}] {line}", end='')
+                if self._stop_reading.is_set():
+                    break
+        self.proc.stdout.close()
+        self.proc.wait()
+
+
+    def _check_disk(self, path):
+        if not path:
+            return
+        
+        full_path = os.path.abspath(path)
+        
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"Disk image not found: {full_path}")
+            
+        if not os.access(full_path, os.R_OK | os.W_OK):
+            # Attempt to fix permissions if you have the rights, 
+            # otherwise raise an error.
+            try:
+                os.chmod(full_path, 0o666)
+            except OSError:
+                raise PermissionError(f"Disk image at {full_path} is not R/W accessible.")
+
+
+    def start(self):
+        ViceInstance.seen_window_ids.clear()
+        base_dir = "/testsrc/"
+        env = os.environ.copy()
+        if "DISPLAY" not in env:
+            env["DISPLAY"] = ":10"
+        if "XAUTHORITY" in os.environ:
+            env["XAUTHORITY"] = os.environ["XAUTHORITY"]
+
+        if self.emubin:
+            cmd = [self.emubin]
+        elif self.archtype == 'c64':
+            cmd = ["x64"]
+        elif self.archtype == 'c128':
+            cmd = ["x128"]
+        elif self.archtype == 'vic20':
+            cmd = ["xvic"]
+        elif self.archtype == 'pet':
+            cmd = ["xpet"]
+        else:
+            raise ValueError(f"Unsupported archtype: {self.archtype}")
+
+        if self.config_path:
+            config_full_path = os.path.abspath(os.path.join(base_dir, self.config_path))
+            cmd += ["-config", config_full_path]
+
+        cmd += ["-remotemonitor", "-remotemonitoraddress", f"127.0.0.1:{self.port}"]
+
+        if self.binmon_port:
+            cmd += ["-binarymonitor", "-binarymonitoraddress", f"127.0.0.1:{self.binmon_port}"]
+
+        if self.warpmode:
+            cmd += ["-warp"]
+        if self.disk8_path:
+            self._check_disk(self.disk8_path) # make sure disk is r/w from os view
+            cmd += ["-8", self.disk8_path]
+        if self.disk9_path:
+            self._check_disk(self.disk9_path)
+            cmd += ["-drive9type", "1541"]
+            cmd += ["-9", self.disk9_path]
+        if self.tape_path:
+            self._check_disk(self.tape_path)  # tape writes need an r/w image
+            # -trapdevice1 keeps the KERNAL tape traps on, so OPEN/CHRIN on
+            # device 1 are serviced at image level instead of by pulse timing.
+            cmd += ["-trapdevice1", "-1", self.tape_path]
+        if self.rom_path:
+            cmd += ["-kernal", self.rom_path]
+        if self.autostart_path:
+            cmd += ["-autostart", self.autostart_path]
+
+        self.cmd = list(cmd)
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env
+        )
+
+        time.sleep(1)
+
+        self.window_id = None
+        self.window_id_40 = None
+        self.window_id_80 = None
+
+        if self.archtype == "c128":
+            for _ in range(20):
+                time.sleep(0.5)
+                wins = self._classify_c128_windows()
+                if not self.window_id_40 and "40col" in wins:
+                    self.window_id_40 = wins["40col"]
+                if not self.window_id_80 and "80col" in wins:
+                    self.window_id_80 = wins["80col"]
+                if self.window_id_40 and self.window_id_80:
+                    break
+
+            # default window is 40-column if available
+            self.window_id = self.window_id_40 or self.window_id_80
+        else:
+            for _ in range(10):
+                time.sleep(0.5)
+                self.window_id = self.find_window_id_by_pid(self.proc.pid)
+                if self.window_id:
+                    break
+
+        if not self.window_id:
+            return False
+
+        self.ready_event.set()
+        self._stop_reading.clear()
+        self.thread = threading.Thread(
+            target=self._reader,
+            name=f"{self.name}-stdout-reader",
+            daemon=True
+        )
+        self.thread.start()
+        process_registry.register(self.name, self.proc)
+        return True
+
+
+    def activate_40col(self):
+        if self.archtype != "c128":
+            return False
+        if not self.window_id_40:
+            return False
+        subprocess.run(
+            ["xdotool", "windowactivate", self.window_id_40],
+            check=True
+        )
+        return True
+
+
+    def _classify_c128_windows(self):
+        windows = {}
+        try:
+            result = subprocess.check_output(
+                ["xdotool", "search", "--pid", str(self.proc.pid)],
+                text=True
+            )
+        except subprocess.CalledProcessError:
+            return windows
+
+        candidates = []
+        for wid in result.splitlines():
+            try:
+                geom = subprocess.check_output(
+                    ["xdotool", "getwindowgeometry", "--shell", wid],
+                    text=True
+                )
+                width = None
+                for line in geom.splitlines():
+                    if line.startswith("WIDTH="):
+                        width = int(line.split("=", 1)[1])
+                        break
+                if width is None or width < 100:  # ignore tiny container windows
+                    continue
+                candidates.append((width, wid))
+            except subprocess.CalledProcessError:
+                continue
+
+        # sort descending by width, assume widest is 80col, next is 40col
+        candidates.sort(reverse=True)
+        if candidates:
+            if len(candidates) >= 1:
+                windows["80col"] = candidates[0][1]
+            if len(candidates) >= 2:
+                windows["40col"] = candidates[1][1]
+
+        return windows
+
+
+    def wait_for_ready(self, timeout=15):
+        self.ready_event.wait(timeout)
+        return wait_for_port("127.0.0.1", self.port, timeout=timeout)
+
+
+    def stop(self, timeout=5):
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        self._stop_reading.set()
+        if self.thread:
+            self.thread.join(timeout=timeout)
+
+        process_registry.unregister(self.name)
+
+
+
+
+
+    def _execute_screenshot(self, win_id, test_step):
+        _helperdir = "/testrunnersrc/pyhelpers"
+        if _helperdir not in sys.path:
+            sys.path.insert(0, _helperdir)
+        from appstate import progress_state
+
+        # "<n>_<action>" during a run, "Idle" outside one -- and a live view
+        # (/api/v1/instances) screenshots an idle instance, so an unguarded
+        # .group(0) would raise AttributeError there.
+        _m = re.match(r'\d+', progress_state.step or "")
+        stepnum = _m.group(0) if _m else "live"
+
+        if not test_step:
+            test_step = stepnum
+
+        if not self.proc or self.proc.poll() is not None:
+            return False, "process not running"
+
+        if not win_id:
+            return False, "no window ID"
+
+        reports_dir = "/testrunnerapp/reports"
+        if not os.path.exists(reports_dir):
+            os.makedirs(reports_dir)
+
+        self.screenshot_count += 1
+        filename = f"screenshot-{self.name}-{test_step}-{self.screenshot_count}.png"
+        filepath = os.path.join(reports_dir, filename)
+
+        try:
+            subprocess.run(["xdotool", "windowmap", win_id], check=True)
+            subprocess.run(["xdotool", "windowactivate", win_id], check=True)
+            time.sleep(0.2)
+            subprocess.run(["import", "-window", win_id, filepath], check=True)
+
+            if croptheimage(filepath):
+                return True, filepath
+            return False, "cropping failed"
+        except subprocess.CalledProcessError as e:
+            return False, str(e)
+
+    def take_screenshot(self, archtype=None, window="default", test_step=None):
+        target_arch = archtype or getattr(self, "archtype", "c64")
+        win_id = None
+
+        if target_arch == "c128":
+            if window == "40col":
+                win_id = getattr(self, "window_id_40", None)
+            elif window == "80col":
+                win_id = getattr(self, "window_id_80", None)
+            else:
+                win_id = self.window_id_40 or self.window_id_80 or self.window_id
+        else:
+            win_id = getattr(self, "window_id", None)
+
+        return self._execute_screenshot(win_id, test_step)
+    
+
+    
+
+
+    def take_screenshotc128(self, test_step=None, filename=None, window="default"):
+        # test
+        _helperdir = "/testrunnersrc/pyhelpers"
+        if _helperdir not in sys.path:
+            sys.path.insert(0, _helperdir)
+        from appstate import progress_state
+        stepnum = progress_state.step
+        stepnum = re.match(r'\d+', stepnum).group(0)
+        if not test_step:
+            test_step = stepnum
+        # test
+        if not self.proc or self.proc.poll() is not None:
+            print(f"[{self.name}] VICE process not running.")
+            return False
+
+        # determine which window to use
+        win_id = None
+        if self.archtype == "c128":
+            if window == "40col":
+                win_id = getattr(self, "window_id_40", None)
+            elif window == "80col":
+                win_id = getattr(self, "window_id_80", None)
+            else:  # default: use 40 first, then 80, then fallback
+                win_id = self.window_id_40 or self.window_id_80 or self.window_id
+        else:
+            win_id = getattr(self, "window_id", None)
+
+        print(f"[{self.name}] Screenshotting window ID: {win_id}")
+
+        if not win_id:
+            print(f"[{self.name}] No window ID cached, cannot take screenshot.")
+            return False
+
+        screenshot_base_dir = "/testrunnerapp/"
+        reports_dir = os.path.join(screenshot_base_dir, "reports")
+        if not os.path.exists(reports_dir):
+            os.makedirs(reports_dir)
+
+        self.screenshot_count += 1
+
+        if filename is None:
+            if test_step:
+                filename = f"screenshot-{self.name}-{test_step}-{self.screenshot_count}.png"
+            else:
+                filename = f"screenshot-{self.name}-{self.screenshot_count}.png"
+
+        filepath = os.path.join(reports_dir, filename)
+
+        try:
+            subprocess.run(["xdotool", "windowmap", win_id], check=True)
+            subprocess.run(["xdotool", "windowactivate", win_id], check=True)
+            time.sleep(0.2)  # give X a moment to map/activate
+            subprocess.run(["import", "-window", win_id, filepath], check=True)
+            print(f"[{self.name}] Screenshot saved to {filepath}")
+
+            if croptheimage(filepath):
+                return True
+            else:
+                print(f"[{self.name}] Failed to crop screenshot")
+                return False
+
+        except subprocess.CalledProcessError as e:
+            print(f"[{self.name}] Failed to take screenshot: {e}")
+            return False
+        
+
+    def capture_qr_string(self, test_step=None, filename=None, window="default"):
+        filepath = self.take_screenshot(test_step=test_step, filename=filename, window=window)
+        if not filepath:
+            return None
+
+        img = cv2.imread(filepath)
+        if img is None:
+            return None
+
+        detector = cv2.QRCodeDetector()
+        data, bbox, straight_qrcode = detector.detectAndDecode(img)
+
+        if not data and bbox is not None:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            sharpen_kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
+            data, bbox, straight_qrcode = detector.detectAndDecode(sharpened)
+
+        return data if data else None
+
+        
+    def find_window_id_by_pid(self, pid):
+        try:
+            result = subprocess.check_output(["xdotool", "search", "--pid", str(pid)])
+            for line in result.decode().splitlines():
+                wid = line.strip()
+                if wid in ViceInstance.seen_window_ids:
+                    continue
+                try:
+                    title = subprocess.check_output(["xdotool", "getwindowname", wid]).decode().strip()
+                    if "VICE" in title or "C64" in title:
+                        ViceInstance.seen_window_ids.add(wid)
+                        return wid
+                except subprocess.CalledProcessError:
+                    continue
+        except subprocess.CalledProcessError:
+            return None
+        return None
+
+
+    def screentextdump(self, context, window="default"):
+        if not self.proc or self.proc.poll() is not None:
+            print("ERRRRRRRORRRR")
+            return None
+
+        win_id = None
+        if self.archtype == "c128":
+            if window == "40col":
+                win_id = getattr(self, "window_id_40", None)
+            elif window == "80col":
+                win_id = getattr(self, "window_id_80", None)
+            else:
+                win_id = self.window_id_40 or self.window_id_80 or self.window_id
+        else:
+            win_id = getattr(self, "window_id", None)
+        if win_id:
+            try:
+                subprocess.run(["xdotool", "windowactivate", win_id], check=True)
+                time.sleep(0.2)
+            except subprocess.CalledProcessError:
+                print(f"[{self.name}] Failed to activate window {win_id}")
+
+        cmd = "sc"
+        output = send_single_command(context, self.name, cmd)
+        
+        if not output:
+            return ""
+
+        lines = output.splitlines()
+        cleaned = []
+        for line in lines:
+            if "(C$:" in line or "---" in line or not line.strip():
+                continue
+            
+            if line.startswith("*C:"):
+                line = line[8:]
+            
+            if line.strip().startswith(">") or line.strip() == cmd:
+                continue
+                
+            cleaned.append(line.rstrip())
+
+        return "\n".join(cleaned)
+
+
+
+
+def croptheimage(image_path):
+    try:
+        img = Image.open(image_path)
+        width, height = img.size
+        # Crop box: (left, upper, right, lower)
+        crop_box = (0, 25, width, height - 75)
+        cropped = img.crop(crop_box)
+        cropped.save(image_path, format='PNG')
+        print(f"Cropped image saved to {image_path}")
+        return True
+    except Exception as e:
+        print(f"Failed to crop image {image_path}: {e}")
+        return False
+
+
+def ocr_word_find(instance, phrase, timeout=10, startx=None, starty=None, stopx=None, stopy=None, errorphrase=None):
+    ocrlogdir = os.path.join(base_dir, "compile_logs")
+    os.makedirs(ocrlogdir, exist_ok=True)
+    print("OCR basedir var: base_dir ", ocrlogdir)
+    print("OCR temp dir: ", ocrlogdir)
+    log = []
+
+    start_time = time.time()
+    phrase_lower = phrase.lower()
+    error_lower = errorphrase.lower() if errorphrase else None
+    attempts = 0
+    text = ""
+
+
+    for i in range(timeout):
+        attempts += 1
+        iter_start = time.time()
+
+        elapsed = int(iter_start - start_time)
+        safe_phrase = phrase.replace(" ", "_")
+        filename_base = f"{safe_phrase}_{elapsed}"
+        screenshot_path = os.path.join(ocrlogdir, filename_base)
+
+        png_path = screenshot_path + ".png"
+        print("taking screenshot at path: ", png_path)
+        txt_path = screenshot_path + ".txt"
+
+        ok, msg = instance.take_screenshot(screenshot_path)
+        print(f'OCR Screenshot Path: {screenshot_path}')
+        if not ok:
+            log.append(f"Screenshot failed: {msg}")
+            continue
+
+        try:
+            print('processing screenshot OCR...')
+            crop_start = time.time()
+
+            img = Image.open(png_path)
+            if None not in (startx, starty, stopx, stopy):
+                img = img.crop((startx, starty, stopx, stopy))
+
+            crop_duration = time.time() - crop_start
+            log.append(f"Crop completed in {crop_duration:.2f} seconds")
+
+            ocr_start = time.time()
+            text = pytesseract.image_to_string(img)
+            ocr_duration = time.time() - ocr_start
+            log.append(f"OCR completed in {ocr_duration:.2f} seconds")
+
+        except Exception as e:
+            log.append(f"OCR failed on {png_path}: {e}")
+            text = ""
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        iter_total = time.time() - iter_start
+        log.append(f"Total time this pass: {iter_total:.2f} seconds\n")
+
+        text_lower = text.lower()
+
+        if phrase_lower in text_lower:
+            return True, text, attempts, log
+        if error_lower and error_lower in text_lower:
+            log.append(f"Aborted early due to error phrase: '{errorphrase}' found in OCR text.")
+            return False, text, attempts, log
+
+        time.sleep(2)
+
+    return False, text, attempts, log
+
+
+
+# CC65 disk stuff #
+
+
+def compile_cc65(source_file, output_file, archtype, extra_flags=None, optimize=False):
+    cmd = ['cc65', '-t', archtype]
+    
+    if optimize:
+        cmd.extend(['-O', '-Oi', '-Or', '-Os', '-Cl'])
+    
+    if extra_flags:
+        cmd.extend(extra_flags)
+        
+    cmd.extend(['-o', output_file, source_file])
+    print("compiling CC65 with command: ", " ".join(cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    
+    success = proc.returncode == 0
+    return success, proc.stdout
+
+
+def assemble_ca65(asm_file, obj_file, archtype):
+    asm_path = os.path.join(base_dir, asm_file)
+    obj_path = os.path.join(base_dir, obj_file)
+
+
+    if not os.path.exists(asm_path):
+        return False, f"Assembly file not found: {asm_path}"
+
+    # Resolve .include / .incbin relative to the source file's own directory
+    # (e.g. sidplaysfx.s does `.incbin "sidmusic1.bin"`). Additive: absolute
+    # paths used by other tests are unaffected.
+    asm_src_dir = os.path.dirname(asm_path)
+    cmd = ['ca65', '-t', archtype,
+           '-I', asm_src_dir, '--bin-include-dir', asm_src_dir,
+           '-o', obj_path, asm_path]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    success = proc.returncode == 0
+    return success, proc.stdout
+
+
+def link_ld65(obj_file, output_file, archtype, linker_cfg=None):
+    cc65_lib_path = "/usr/share/cc65/lib"
+    if isinstance(obj_file, (list, tuple)):
+        obj_files = obj_file
+    else:
+        obj_files = [obj_file]
+
+    obj_paths = [os.path.join(base_dir, f) for f in obj_files]
+    output_path = os.path.join(base_dir, output_file)
+
+    for p in obj_paths:
+        if not os.path.exists(p):
+            return False, f"Object file not found: {p}"
+
+    cmd = ['ld65']
+    cmd.extend(['-L', cc65_lib_path])
+    if linker_cfg is not None:
+        conf_path = os.path.join(base_dir, linker_cfg)
+        if not os.path.exists(conf_path):
+            return False, f"Linker config not found: {conf_path}"
+        cmd.extend(['-C', conf_path])
+    else:
+        # If no custom config
+        cmd.extend(['-t', archtype])
+
+    cmd.extend(['-o', output_path])
+    cmd.extend(obj_paths)
+
+    if archtype == 'c64':
+        cmd.append('c64.lib')
+    elif archtype == 'c128':
+        cmd.append('c128.lib')    
+    elif archtype == 'vic20':
+        cmd.append('vic20.lib')
+    elif archtype == 'pet':
+        cmd.append('pet.lib')
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    success = proc.returncode == 0
+    if success and not os.path.exists(output_path):
+        return False, f"Link failed, {output_path} not created"
+
+    return success, proc.stdout
+
+
+def create_blank_d64(d64_name, base_dir=base_dir):
+    d64_path = os.path.join(base_dir, d64_name)
+    os.makedirs(os.path.dirname(d64_path), exist_ok=True)
+
+    try:
+        with open(d64_path, 'wb') as f:
+            f.write(b'\x00' * 174848)
+    except Exception as e:
+        return False, f"Failed to create empty d64: {e}"
+
+    # D64 disk names are 16 PETSCII chars; c1541 does the ASCII->PETSCII
+    # conversion itself, so pass a plain uppercase ASCII label here.
+    raw_label = os.path.splitext(os.path.basename(d64_name))[0].upper()
+    disk_label = re.sub(r'[^A-Z0-9 ]', '_', raw_label)[:16].strip() or 'UNTITLED'
+
+    cmd = ['c1541', '-attach', d64_path, '-format', f'{disk_label},08']
+    proc = subprocess.run(cmd, cwd=base_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    success = proc.returncode == 0
+    return success, proc.stdout
+
+
+def create_blank_tap(tap_name, pad_bytes=1024, base_dir=base_dir):
+    """Write an empty VICE .tap (v1) image the datasette can record onto.
+
+    The 20-byte header alone is not enough: VICE refuses to attach a .tap
+    whose file is only a header, so the image carries a run of zero-length
+    pulse bytes (blank tape) after it."""
+    tap_path = os.path.join(base_dir, tap_name)
+    os.makedirs(os.path.dirname(tap_path), exist_ok=True)
+
+    # "C64-TAPE-RAW", version 1, platform/video/reserved, then data length.
+    header = b"C64-TAPE-RAW" + bytes([1, 0, 0, 0]) + struct.pack("<I", pad_bytes)
+
+    try:
+        with open(tap_path, "wb") as f:
+            f.write(header)
+            f.write(b"\x00" * pad_bytes)
+    except Exception as e:
+        return False, f"Failed to create blank tap: {e}"
+
+    return True, f"Created blank tap image: {tap_path} ({len(header) + pad_bytes} bytes)"
+
+
+# Datasette buttons as named by the VICE monitor's "tapectrl" command.
+TAPE_CONTROLS = {
+    "stop": 0,
+    "start": 1,
+    "play": 1,
+    "forward": 2,
+    "rewind": 3,
+    "record": 4,
+    "reset": 5,
+    "resetcounter": 6,
+}
+
+
+def tape_control(context, name, command):
+    """Press a datasette button on a running VICE instance."""
+    key = str(command).strip().lower()
+    if key in TAPE_CONTROLS:
+        code = TAPE_CONTROLS[key]
+    else:
+        try:
+            code = int(key, 0)
+        except ValueError:
+            raise ValueError(f"Unknown tape control: {command!r} "
+                             f"(use one of {sorted(TAPE_CONTROLS)} or a tapectrl code)")
+
+    return send_single_command(context, name, f"tapectrl {code}")
+
+
+def format_and_copyd64(d64_name, prg_file, base_dir=base_dir):
+    d64_path = os.path.join(base_dir, d64_name)
+    prg_path = os.path.join(base_dir, prg_file)
+
+    if not os.path.exists(prg_path):
+        return False, f"PRG file not found: {prg_path}"
+
+    destination_name = f"{os.path.basename(prg_path)},p"
+    cmd = ['c1541', '-attach', d64_path, '-write', prg_path, destination_name]
+    #cmd = ['c1541', '-attach', d64_path, '-write', prg_path]
+    proc = subprocess.run(cmd, cwd=base_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    success = proc.returncode == 0
+    return success, proc.stdout
+
+
+
+
+import shutil
+import subprocess
+
+
+
+def assemble_object(ser_file, s_file, label, base_dir=base_dir):
+    ser_file = os.path.abspath(os.path.join(base_dir, ser_file))
+    s_file = os.path.abspath(os.path.join(base_dir, s_file))
+
+    out_dir = os.path.dirname(s_file)
+    os.makedirs(out_dir, exist_ok=True)
+
+    local_ser = os.path.join(out_dir, os.path.basename(ser_file))
+    shutil.copyfile(ser_file, local_ser)
+
+    # co65 --code-label requires a valid C identifier (letters/digits/underscores).
+    # Sanitize: replace any character that isn't alphanumeric or _ with _.
+    # Then prepend _ to match cc65's C name-mangling convention so the linker
+    # finds the symbol when C code declares: extern unsigned char label[];
+    import re as _re
+    safe_label = _re.sub(r"[^A-Za-z0-9_]", "_", label)
+    safe_label = "_" + safe_label
+
+    cmd = [
+        "co65",
+        "--code-label",
+        safe_label,
+        os.path.basename(local_ser)
+    ]
+
+    proc = subprocess.run(cmd, cwd=out_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    success = proc.returncode == 0
+
+    generated_s = os.path.join(out_dir, os.path.splitext(os.path.basename(local_ser))[0] + ".s")
+    if success and generated_s != s_file:
+        os.replace(generated_s, s_file)
+
+    return success, proc.stdout

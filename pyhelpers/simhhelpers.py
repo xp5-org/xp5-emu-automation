@@ -1,16 +1,21 @@
 import argparse
 import subprocess
 import os
-import pty
+import re
 import select
 import shutil
+import signal
 import socket
 import sys
-import termios
 import time
 import threading
 import tempfile
-import tty
+
+# pty/termios/tty are POSIX-only; module import must still succeed on Windows
+if not sys.platform.startswith("win"):
+    import pty
+    import termios
+    import tty
 
 HELPERDIR = os.path.dirname(os.path.abspath(__file__))
 if HELPERDIR not in sys.path:
@@ -25,17 +30,15 @@ except ImportError:
         register = staticmethod(lambda *a, **k: None)
         unregister = staticmethod(lambda *a, **k: None)
 
-TESTSRC_BASEDIR = "/testsrc"
+TESTSRC_BASEDIR = os.environ.get("TESTSRC_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Prefer a vendored dgnova (disk_artifacts/bin/dgnova) if present, falling back to PATH. 
+# vendored disk_artifacts/bin/dgnova, else PATH
 _VENDORED_DGNOVA = os.path.join(TESTSRC_BASEDIR, "disk_artifacts", "bin", "dgnova")
 DGNOVA_BIN = _VENDORED_DGNOVA if os.path.exists(_VENDORED_DGNOVA) else "dgnova"
 
 DEFAULT_DISK_IMAGE = os.path.join(TESTSRC_BASEDIR, "sourcedir/nova_rdos/rdos_d31.dsk")
 
-# dgnova console emulation (the RDOS boot banner, "Filename?"/Date/Time
-# prompts, and the "R" prompt) only behaves correctly when its stdio is a
-# real tty 
+# dgnova console needs a real tty on stdio
 DEFAULT_BOOT_SCRIPT = """\
 {memory_line}attach dkp0 {disk_image}
 set tti dasher
@@ -49,16 +52,12 @@ class NovaSimhInstance:
         self.name = name
         self.disk_image = disk_image or DEFAULT_DISK_IMAGE
         self.script_path = script_path
-        # dgnova defaults to 32KW; pass e.g. "60k" (its max) for programs
-        # like the RDOS COBOL compiler that need more than the default.
+        # memory size, e.g. "60k" (dgnova max; default 32KW)
         self.memory = memory
-        # A project can supply its own simulator build - sourcedir/nova_fb 
+        # project-supplied simulator build; relative script paths resolve against its cwd
         self.binary = binary or DGNOVA_BIN
-        # SIMH resolves relative paths in a script (e.g. "set fb prefix=
-        # output/cursor") against its own cwd, so a project driving its own
-        # script needs to run from the project directory.
         self.cwd = cwd
-        # nova_fb's live view sink
+        # nova_fb live view sink
         self.live_path = live_path
         self.process = None
         self.pid = None
@@ -77,7 +76,7 @@ class NovaSimhInstance:
         if self.script_path:
             if not self.live_path:
                 return self.script_path
-            # "set fb live=" has to run before the program does
+            # set fb live= must run before the program
             return self._wrapper_script(
                 f"set fb live={self.live_path}\ndo {self.script_path}\n")
         memory_line = f"set cpu {self.memory}\n" if self.memory else ""
@@ -138,8 +137,7 @@ class NovaSimhInstance:
 
 
     def _tee(self, data):
-        """Fan console output out to any attached terminal windows.
-        """
+        """Fan console output out to attached terminal windows."""
         with self._clients_lock:
             clients = list(self._clients)
         for conn in clients:
@@ -158,8 +156,7 @@ class NovaSimhInstance:
             pass
 
     def open_console_relay(self, sock_path):
-        """Serve this instance's console on a Unix socket. Returns the path.
-        """
+        """Serve this instance's console on a Unix socket -> path."""
         if self.console_sock_path:
             return self.console_sock_path
         if os.path.exists(sock_path):
@@ -184,8 +181,7 @@ class NovaSimhInstance:
                 break
             with self._clients_lock:
                 self._clients.append(conn)
-            # A terminal that attaches late is otherwise looking at a blank
-            # window . Replay the recent console so it opens on the prompt.
+            # replay recent console so a late terminal opens on the prompt
             try:
                 conn.sendall(self.buf[-4000:].encode(errors="replace"))
             except Exception:
@@ -246,16 +242,147 @@ class NovaSimhInstance:
             os.write(self.master_fd, (cmd_text + "\r").encode())
 
     def break_to_scp(self):
-        # Ctrl-E is SIMH's default WRU character; it interrupts the running
-        # simulation and drops back to the SCP ("sim>") command prompt.
+        # Ctrl-E (WRU): interrupt to the sim> prompt
         if self.master_fd is not None:
             os.write(self.master_fd, b"\x05")
             time.sleep(0.5)
 
+    # snapshots (duck-typed by snaptimeline): .sav plus a copy of each writable attached unit's file; errors return "Error: ..." for qemuhelpers.hmp_error()
+    SNAPSHOT_DEVICES = ("dkp", "dsk", "mta")
+    _ATTACHED_RE = re.compile(r"^\s*([A-Za-z]+\d*)\b[^\r\n]*?attached to ([^,\r\n]+)", re.M)
+    _SCP_ERR = ("invalid", "non-existent", "command not completed", "cannot",
+                "error", "unknown", "not found")
+
+    def _scp(self, cmd, timeout=30):
+        """Run one SCP command and return its output (up to the next prompt)."""
+        mark = len(self.buf)
+        self.send_command(cmd)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if "sim>" in self.buf[mark:] or self.process.poll() is not None:
+                break
+            time.sleep(0.05)
+        return self.buf[mark:]
+
+    def _enter_scp(self, halted=False):
+        """Stop the simulation at the sim> prompt -> True if it was running (caller `cont`s), False if already halted, None if no prompt appeared. halted=True: the caller knows it is at sim> already (a SIGINT there leaves the console deaf)."""
+        if halted:
+            return False
+        mark = len(self.buf)
+        # SIGINT: with `set tti dasher` ^E goes to the guest
+        os.kill(self.pid, signal.SIGINT)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            out = self.buf[mark:]
+            if "sim>" in out:
+                return "Simulation stopped" in out
+            time.sleep(0.05)
+        # already at the prompt: SIGINT did nothing
+        if "sim>" in self._scp("", timeout=3):
+            return False
+        return None
+
+    def _scp_error(self, out):
+        for line in (out or "").replace("\r", "").splitlines():
+            if line.strip().lower().startswith(self._SCP_ERR) or \
+                    "not completed" in line.lower():
+                return line.strip()
+        return ""
+
+    def _attached_units(self):
+        """[(unit, host_path)] for every writable attached disk/tape unit."""
+        units = []
+        for dev in self.SNAPSHOT_DEVICES:
+            out = self._scp(f"show {dev}", timeout=5)
+            for line in out.replace("\r", "").splitlines():
+                m = self._ATTACHED_RE.match(line)
+                if m and "read only" not in line.lower():
+                    units.append((m.group(1), m.group(2).strip()))
+        return units
+
+    def referenced_disk_images(self, args=None):
+        """Qcow2 images this instance uses (for runsession to relocate); none (SIMH units are raw and copied by save_snapshot)."""
+        return []
+
+    def _snap_dir(self):
+        if not getattr(self, "_snap_root", None):
+            self._snap_root = tempfile.mkdtemp(prefix=f"simhsnap_{self.name}_")
+            self._snaps = {}
+        return self._snap_root
+
+    def save_snapshot(self, tag="quicksave", halted=False):
+        """SAVE + copy of every writable attached unit; pauses and resumes the simulation -> reply text, "Error: ..." on failure."""
+        if self.master_fd is None or self.process is None or self.process.poll() is not None:
+            return "Error: simulator not running"
+        root = self._snap_dir()
+        console = self.buf
+        running = self._enter_scp(halted)
+        if running is None:
+            return "Error: no sim> prompt after SIGINT (console busy?)"
+        sav = os.path.join(root, f"{tag}.sav")
+        disks, log, err = {}, [], ""
+        try:
+            out = self._scp(f"save {sav}")
+            err = self._scp_error(out)
+            log.append(out.strip())
+            if not err:
+                for unit, path in self._attached_units():
+                    self._scp(f"detach {unit}", timeout=10)
+                    try:
+                        copy = os.path.join(root, f"{tag}.{unit}.img")
+                        shutil.copyfile(path, copy)
+                        disks[unit] = (path, copy)
+                    except OSError as e:
+                        err = f"could not copy {path}: {e}"
+                    out = self._scp(f"attach {unit} {path}", timeout=10)
+                    err = err or self._scp_error(out)
+        finally:
+            if running:
+                self._scp("cont", timeout=2)
+        if err:
+            for f in [sav] + [c for _, c in disks.values()]:
+                if os.path.exists(f):
+                    os.remove(f)
+            return f"Error: {err}"
+        self._snaps[tag] = {"sav": sav, "disks": disks, "running": running,
+                            "console": console}
+        return f"saved {tag}: {os.path.getsize(sav)} bytes state, {len(disks)} unit(s) copied\n" + "\n".join(log)
+
+    def load_snapshot(self, tag="quicksave", halted=False):
+        """Restore unit copies, RESTORE, resume if live when saved; the console buffer is restored too (test_novascreensearch can't match undone text)."""
+        meta = getattr(self, "_snaps", {}).get(tag)
+        if meta is None:
+            return f"Error: no snapshot {tag!r} on {self.name}"
+        if self.master_fd is None or self.process.poll() is not None:
+            return "Error: simulator not running"
+        if self._enter_scp(halted) is None:
+            return "Error: no sim> prompt after SIGINT (console busy?)"
+        err = ""
+        for unit, (path, copy) in meta["disks"].items():
+            self._scp(f"detach {unit}", timeout=10)
+            try:
+                shutil.copyfile(copy, path)
+            except OSError as e:
+                err = f"could not restore {path}: {e}"
+        out = self._scp(f"restore {meta['sav']}")
+        err = err or self._scp_error(out)
+        if err:
+            return f"Error: {err}"
+        self.buf = meta["console"]
+        if meta["running"]:
+            self.send_command("cont")
+        return f"restored {tag}\n{out.strip()}"
+
+    def delete_snapshot(self, tag):
+        meta = getattr(self, "_snaps", {}).pop(tag, None)
+        if meta:
+            for f in [meta["sav"]] + [c for _, c in meta["disks"].values()]:
+                if os.path.exists(f):
+                    os.remove(f)
+        return f"deleted {tag}"
+
     def boot_to_rdos(self, date=None, time_str=None, timeout=30):
-        """Drives the fixed prompt sequence dgnova/RDOS presents on cold boot:
-        Filename? -> [optional "Partition in use" nag] -> Date -> Time -> R
-        """
+        """Drive dgnova/RDOS cold boot prompts: Filename? -> [optional "Partition in use"] -> Date -> Time -> R"""
         date = date or time.strftime("%m/%d/%Y")
         time_str = time_str or time.strftime("%H:%M:%S")
 
@@ -300,13 +427,12 @@ class NovaSimhInstance:
             self.master_fd = None
         if self._generated_script and os.path.exists(self._generated_script):
             os.remove(self._generated_script)
+        if getattr(self, "_snap_root", None):
+            shutil.rmtree(self._snap_root, ignore_errors=True)
+            self._snap_root = None
 
 
-# NovaSimhInstance owns the pty master for the
-# life of the run and its reader thread is what every test_novascreensearch
-# assertion reads from. A second process cannot open that master
-
-QUIT = b"\x1d"                                   # Ctrl-]
+QUIT = b"\x1d"
 
 
 def connect(path, wait):
@@ -344,7 +470,7 @@ def novaterm_main(argv=None):
         saved = termios.tcgetattr(stdin)
         tty.setraw(stdin)
     except Exception:
-        # Not a tty (piped, or run outside a terminal): still usable one-way.
+        # not a tty: one-way only
         saved = None
 
     try:
@@ -370,8 +496,7 @@ def novaterm_main(argv=None):
         except Exception:
             pass
 
-    # The window closing the instant the run ends hides whatever the console
-    # said last, which is usually the interesting part.
+    # keep the window open after exit so the last console output is readable
     sys.stdout.write("\r\n[novaterm] console closed -- press RETURN\r\n")
     sys.stdout.flush()
     try:
@@ -380,14 +505,11 @@ def novaterm_main(argv=None):
         pass
     return 0
 
-# NovaTermProcess opens an xterm on the user's desktop attached to a Nova's
-# SIMH console.
+# xterm attached to a Nova's SIMH console
 
 NOVATERM_PY = os.path.abspath(__file__)
 
-# xterm first: it is the only one of these that reliably STAYS the process it
-# started, so process.poll() means what it says. xfce4-terminal hands off to an
-# already-running server and exits immediately, which would look like a crash.
+# xterm: stays the launched process (xfce4-terminal hands off and exits)
 TERMINALS = ["xterm", "x-terminal-emulator"]
 
 
@@ -424,8 +546,7 @@ class NovaTermProcess(object):
             inner += ["--banner", self.banner]
         argv = [self.terminal, "-T", self.title, "-geometry", self.geometry]
         if os.path.basename(self.terminal) == "xterm":
-            # A framebuffer demo is something people lean in to read; the
-            # default 6x13 bitmap font on a HiDPI RDP session is not that.
+            # larger font for HiDPI RDP
             argv += ["-fa", "monospace", "-fs", str(self.font_size),
                      "-bg", "black", "-fg", "white"]
         return argv + ["-e"] + inner
@@ -453,8 +574,7 @@ class NovaTermProcess(object):
         self.pid = self.process.pid
         processreg.register(self.name, self.process, source="nova_terminal")
 
-        # It exits at once on an unreachable X display; a moment's grace turns
-        # that into a message rather than a window that never appeared.
+        # exits at once on an unreachable X display: report it
         time.sleep(1.0)
         if self.process.poll() is not None:
             err = ""
@@ -486,22 +606,12 @@ class NovaTermProcess(object):
         self.process = None
 
 
-
-
-
-
-# this stuff should be moved into its own file eventually
-
 def _default_cully_llvm_dir():
     return os.path.join(TESTSRC_BASEDIR, "sourcedir", "cully_llvm")
 
 
 def nova_llvm_toolchain_paths(cully_llvm_dir=None):
-    """Resolve nova-cc/_toolchain paths under a cully_llvm checkout
-    (defaults to sourcedir/cully_llvm). 
-    
-    safe to call even when cully_llvm/ or its
-    _toolchain/ don't exist."""
+    """Paths under a cully_llvm checkout (default sourcedir/cully_llvm): nova-cc and _toolchain; safe if they don't exist."""
     base = cully_llvm_dir or _default_cully_llvm_dir()
     toolchain_dir = os.path.join(base, "_toolchain")
     return {
@@ -514,15 +624,7 @@ def nova_llvm_toolchain_paths(cully_llvm_dir=None):
 
 def compile_via_nova_llvm(src_path, out_path, cpu="nova3", cully_llvm_dir=None,
                            header_lines=None, footer_lines=None, timeout=120):
-    """Compile one C source through cullyrichard's nova-llvm-backend
-    (nova-cc -t <cpu>) into a SIMH deposit script 
-    
-
-    Returns (bool, str)
-    
-    a missing/unbuilt is reported, not raised as error. 
-    a caller gets a step error message returned if toolchain not present
-    """
+    """Compile one C source via nova-llvm-backend (nova-cc -t <cpu>) into a SIMH deposit script -> (bool, str); a missing toolchain returns an error message, not an exception."""
     if not src_path:
         return False, "compile_via_nova_llvm: no src_path given"
     if not os.path.exists(src_path):

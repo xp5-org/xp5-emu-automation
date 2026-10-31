@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""for driving and watching a Verilator VGA testbench
-  - VerilatorLiveInstance 
-
-  - VgaFbLive frame_to_rgb reads a Verilator testbenchm view sink.
-
-    WIRE FORMAT little-endian uint32 header, then payload
-
+"""Driving and watching a Verilator VGA testbench:
+  - VerilatorLiveInstance
+  - VgaFbLive: reader of the testbench live view sink. Little-endian uint32 header, then payload:
         0   MAGIC    "VLFB" = 0x42464C56
         1   VERSION  1
         2   FORMAT   1 = FMT_RGB1, 1 byte/pixel: bit2=R, bit1=G, bit0=B
+                 2 = FMT_RGB565, 2 bytes/pixel little-endian: R[15:11] G[10:5] B[4:0]
         3   WIDTH    pixels
         4   HEIGHT   pixels
         5   STRIDE   bytes per row (== WIDTH for FMT_RGB1)
@@ -16,15 +13,10 @@
         7   SEQ      seqlock, odd while publish() is mid-write
         8   FRAME    frames presented
         9-15         reserved, zero
-
-  - Monitor / main() -- a pygame window fed by the live view sink. Run it
-    beside a testbench started with --live:
-
+  - Monitor / main(): pygame window on the sink, beside a testbench started with --live:
         python3 /testsrc/pyhelpers/verilatorvgahelpers.py --live /dev/shm/vgafb
-
     Keys:  ESC / Q  quit        1-8  integer zoom        F  fit to window
-
-  - VerilatorFbMonitorProcess runs the Monitor's main() 
+  - VerilatorFbMonitorProcess: runs main() as a child process.
 """
 
 import argparse
@@ -53,19 +45,19 @@ except ImportError:
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 
-
 class VerilatorLiveInstance(object):
     def __init__(self, name, binary=None, live_path=None, cwd=None,
-                 seconds=0):
+                 seconds=0, stats_path=None, extra_args=None):
         self.name = name
         self.binary = binary
-        # Passed straight through as --live <path> -- the testbench opens
-        # this sink and publishes a frame to it each time it completes one.
+        # --live sink: testbench publishes a frame to it per completed frame
         self.live_path = live_path
         self.cwd = cwd
-        # 0 = run until stop() signals it; a testlist that wants a bounded
-        # demo run instead of a person-driven one can cap it here.
+        # 0 = run until stop()
         self.seconds = seconds
+        # --stats sink: testbench (vstats.hpp) publishes a JSON snapshot there; see verilatorhelpers.StatsReader
+        self.stats_path = stats_path
+        self.extra_args = list(extra_args or [])
         self.process = None
         self.pid = None
 
@@ -75,7 +67,16 @@ class VerilatorLiveInstance(object):
             argv += ["--live", self.live_path]
         if self.seconds:
             argv += ["--seconds", str(self.seconds)]
-        return argv
+        if self.stats_path:
+            argv += ["--stats", self.stats_path]
+        return argv + self.extra_args
+
+    def stats(self):
+        """Latest stats snapshot dict, or None (no --stats sink, or not written yet)."""
+        if not self.stats_path:
+            return None
+        from verilatorhelpers import StatsReader
+        return StatsReader(self.stats_path).read()
 
     def start(self):
         if not self.binary or not os.path.exists(self.binary):
@@ -111,17 +112,16 @@ class VerilatorLiveInstance(object):
         if self.process is None:
             return
         if self.process.poll() is None:
-            # vga_tb.cpp installs SIGINT/SIGTERM handlers
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5)
+        if self.process.stderr:
+            self.process.stderr.close()
         self.process = None
 
-
-# live sink protocol
 
 MAGIC = 0x42464C56
 VERSION = 1
@@ -131,6 +131,7 @@ MAX_PAYLOAD = 1024 * 1024 * 4
 FILE_BYTES = HDR_BYTES + MAX_PAYLOAD
 
 FMT_RGB1 = 1
+FMT_RGB565 = 2
 
 DEFAULT_LIVE_PATH = "/dev/shm/vgafb"
 
@@ -165,8 +166,7 @@ class VgaFbError(Exception):
 
 
 class VgaFbLive(object):
-    """mmap reader for one live_sink.hpp sink. See NovaFbLive (novafbhelpers.py)
-    for the full read()/seqlock discussion -- this is the same shape."""
+    """mmap reader for one live_sink.hpp sink (same shape as NovaFbLive, novafbhelpers.py)."""
 
     def __init__(self, path=DEFAULT_LIVE_PATH):
         self.path = path
@@ -275,11 +275,8 @@ class VgaFbLive(object):
         return self._header()[H_FRAME]
 
 
-# pixel unpacking
-
 def rgb1_to_rgb(frame):
-    """Expand a FMT_RGB1 Frame (1 byte/pixel, bit2=R bit1=G bit0=B) to packed
-    RGB888 bytes."""
+    """FMT_RGB1 Frame (1 byte/pixel, bit2=R bit1=G bit0=B) -> packed RGB888 bytes."""
     if frame.fmt != FMT_RGB1:
         raise VgaFbError("rgb1_to_rgb: frame format %d is not RGB1" % frame.fmt)
 
@@ -304,15 +301,38 @@ def rgb1_to_rgb(frame):
         return bytes(out)
 
 
+def rgb565_to_rgb(frame):
+    """FMT_RGB565 Frame (little-endian 16-bit pixels) -> packed RGB888 bytes."""
+    w, h, stride = frame.width, frame.height, frame.stride
+    try:
+        import numpy as np
+        raw = np.frombuffer(frame.pixels[:stride * h], dtype="<u2")
+        raw = raw.reshape(h, stride // 2)[:, :w].astype(np.uint16)
+        r = ((raw >> 11) & 31).astype(np.uint8)
+        g = ((raw >> 5) & 63).astype(np.uint8)
+        b = (raw & 31).astype(np.uint8)
+        return np.stack([(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)],
+                        axis=-1).tobytes()
+    except ImportError:
+        out = bytearray()
+        for row in range(h):
+            base = row * stride
+            for i in range(w):
+                p = frame.pixels[base + 2 * i] | (frame.pixels[base + 2 * i + 1] << 8)
+                r, g, b = (p >> 11) & 31, (p >> 5) & 63, p & 31
+                out += bytes(((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)))
+        return bytes(out)
+
+
 def frame_to_rgb(frame):
     if frame.fmt == FMT_RGB1:
         return rgb1_to_rgb(frame)
+    if frame.fmt == FMT_RGB565:
+        return rgb565_to_rgb(frame)
     raise VgaFbError(
-        "unknown live frame format %d -- this reader understands RGB1 only"
+        "unknown live frame format %d -- this reader understands RGB1 and RGB565"
         % frame.fmt)
 
-
-# pygame Monitor
 
 DEFAULT_WINDOW = (640, 480)
 MAX_AUTO_SCALE = 4
@@ -393,10 +413,7 @@ class Monitor(object):
 
     def run(self):
         os.environ["DISPLAY"] = _resolve_display(os.environ.get("DISPLAY"))
-        # See novafbhelpers.Monitor.run(): full pygame.init() also brings up
-        # the mixer, and SDL's audio-backend probe in a container/RDP session
-        # with no real device is where the multi-second delay before any
-        # window appears comes from. This viewer never plays sound.
+        # pygame.init() minus the mixer; avoids the SDL audio probe delay
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
         import pygame
 
@@ -479,8 +496,6 @@ def main(argv=None):
     sys.stderr.write("verilatorfbmonitor: %d frames shown\n" % shown)
     return 0
 
-
-# -- VerilatorFbMonitorProcess (subprocess wrapper) --------------------------
 
 class VerilatorFbMonitorProcess(object):
     def __init__(self, name="verilatorfb_monitor", live_path=DEFAULT_LIVE_PATH,

@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
-"""Everything for reading and watching the nova_fb card's live view sink,
-merged from three former siblings (novafbhelpers.py, novafbmonitor.py,
-novafbmonitor_proc.py):
-
-  - NovaFbLive / Frame / frame_to_rgb -- the reader half of the live sink.
-
-    `SET FB LIVE=<path>` adds a second sink beside the PNG one. present()
-    copies the front buffer into a shared-memory file, and any number of
-    reader processes mmap it and redraw. 
-
-    little-endian uint32 header, then payload)
-
+"""nova_fb live view sink: reader, viewer, and viewer subprocess wrapper (merged from novafbhelpers, novafbmonitor, novafbmonitor_proc).
+  - NovaFbLive / Frame / frame_to_rgb: reader for `SET FB LIVE=<path>`; present() copies the front buffer into a shared-memory file that reader processes mmap.
+    Little-endian uint32 header, then payload:
         0   MAGIC    "NVFB" = 0x4246564E
         1   VERSION  1
         2   FORMAT   1 = FMT_MONO1, packed 1bpp
@@ -19,27 +10,14 @@ novafbmonitor_proc.py):
         5   STRIDE   bytes per row
         6   BYTES    payload bytes in use
         7   SEQ      seqlock, odd while present() is mid-write
-        8   FRAME    frames presented, matches the FB FRAME register
+        8   FRAME    frames presented (FB FRAME register)
         9-15         reserved, zero
-
-    The file is a fixed 64 + 4MiB regardless of the current mode 
-
-
-  - Monitor / main() -- a pygame window fed by the live view sink. Run it
-    beside a simulator whose SIMH script contains `set fb live=<path>`:
-
+    File is a fixed 64 + 4MiB regardless of mode.
+  - Monitor / main(): pygame window on the sink (read-only), beside a simulator whose SIMH script has `set fb live=<path>`:
         python3 /testsrc/pyhelpers/novafbhelpers.py --live /dev/shm/novafb
-
-
-    --scale multiplies that (a 256x256 frame at 3x is a 768x768 window); 0,
-    the default
-
-    The viewer is readonly and does not write back to the simh bridge
-
+    --scale N multiplies the zoom (256x256 at 3x = 768x768); 0 (default) = auto.
     Keys:  ESC / Q  quit        1-8  integer zoom        F  fit to window
-
-  - NovaFbMonitorProcess -- runs the Monitor's main() as a child process, 
-    so a testlist can hold on to it. 
+  - NovaFbMonitorProcess: runs main() as a child process a testlist can hold.
 """
 
 import argparse
@@ -68,7 +46,6 @@ except ImportError:
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 
-
 MAGIC = 0x4246564E
 VERSION = 1
 HDR_BYTES = 64
@@ -76,11 +53,11 @@ HDR_WORDS = 16
 MAX_PAYLOAD = 1024 * 1024 * 4
 FILE_BYTES = HDR_BYTES + MAX_PAYLOAD
 
-FMT_MONO1 = 1                       # packed 1bpp, bit 7 of a byte is leftmost
+FMT_MONO1 = 1
 
 DEFAULT_LIVE_PATH = "/dev/shm/novafb"
 
-# Header word indices, matching the #defines in nova_fb.c.
+# Header word indices; match #defines in nova_fb.c
 (H_MAGIC, H_VERSION, H_FORMAT, H_WIDTH, H_HEIGHT,
  H_STRIDE, H_BYTES, H_SEQ, H_FRAME) = range(9)
 
@@ -114,10 +91,7 @@ class NovaFbError(Exception):
 
 
 class NovaFbLive(object):
-    """mmap reader for one `SET FB LIVE=` sink.
-
-    Open it, then call read()
-    """
+    """mmap reader for one `SET FB LIVE=` sink; open, then read()."""
 
     def __init__(self, path=DEFAULT_LIVE_PATH):
         self.path = path
@@ -158,11 +132,7 @@ class NovaFbLive(object):
         return self
 
     def wait_open(self, timeout=30.0, poll=0.1):
-        """Wait for the simulator to create the sink, then open it.
-
-        A viewer is usually started beside the simulator rather than after it,
-        so the file legitimately does not exist yet for the first moment.
-        """
+        """Wait for the simulator to create the sink file, then open it."""
         deadline = time.time() + float(timeout)
         last = None
         while time.time() < deadline:
@@ -192,21 +162,14 @@ class NovaFbLive(object):
         return _HDR.unpack(self._map[:HDR_BYTES])
 
     def read(self, retries=8, only_new=True):
-        """Return the current Frame, or None.
-
-        only_new=True  returns None when the frame counter has
-        not advanced
-        
-
-        Returns None if it cant read frame counter
-        """
+        """Current Frame, or None. only_new=True: None if the frame counter has not advanced. None also if the counter can't be read."""
         if self._map is None:
             raise NovaFbError("read() before open()")
 
         for _ in range(max(1, int(retries))):
             hdr = self._header()
             seq = hdr[H_SEQ]
-            if seq & 1:                             # writer mid-copy
+            if seq & 1:
                 continue
             fmt = hdr[H_FORMAT]
             w, h = hdr[H_WIDTH], hdr[H_HEIGHT]
@@ -217,13 +180,13 @@ class NovaFbLive(object):
                     and (w, h, fmt) == self._last_geom):
                 return None
             if not (0 < w <= 1024 and 0 < h <= 1024):
-                continue                            # header caught mid-update
+                continue
             if not (0 < nbytes <= MAX_PAYLOAD):
                 continue
 
             pixels = self._map[HDR_BYTES:HDR_BYTES + nbytes]
 
-            if self._header()[H_SEQ] != seq:        # torn: writer overtook us
+            if self._header()[H_SEQ] != seq:
                 continue
 
             self._last_seq = seq
@@ -258,8 +221,7 @@ def _lut_rgb():
 
 
 def mono_to_rgb(frame):
-    """Expand a FMT_MONO1 Frame to packed RGB888 bytes, white on black.
-    """
+    """FMT_MONO1 Frame -> packed RGB888 bytes, white on black."""
     if frame.fmt != FMT_MONO1:
         raise NovaFbError("mono_to_rgb: frame format %d is not mono" % frame.fmt)
 
@@ -281,8 +243,7 @@ def mono_to_rgb(frame):
 
 
 def frame_to_rgb(frame):
-    """Packed RGB888 for any frame format the card can publish.
-    """
+    """Any published frame format -> packed RGB888."""
     if frame.fmt == FMT_MONO1:
         return mono_to_rgb(frame)
     raise NovaFbError(
@@ -291,13 +252,11 @@ def frame_to_rgb(frame):
 
 
 DEFAULT_WINDOW = (640, 480)
-MAX_AUTO_SCALE = 4              # auto zoom stops here even on a huge display
+MAX_AUTO_SCALE = 4
 
 
 def _resolve_display(explicit=None):
-    """The X display an emulator window should open on.
-
-    """
+    """X display emulator windows open on."""
     try:
         from displayhelpers import resolve_display
         return resolve_display(explicit)
@@ -315,22 +274,19 @@ class Monitor(object):
         self.title = title or "Nova FB - %s" % os.path.basename(live_path)
         self.wait = float(wait)
         self.exit_when_gone = exit_when_gone
-        self.window = window        # current window size = mode x zoom
+        self.window = window
         self.screen = None
-        self.surface = None          # frame at native size, before scaling
-        self.mode = (0, 0)           # native geometry currently on screen
+        self.surface = None
+        self.mode = (0, 0)
         self.frames_shown = 0
 
 
     def _auto_scale(self, pygame, size):
-        """Largest integer zoom that still fits on the X display, at least 1.
-
-        Only consulted when --scale is 0. 
-        """
+        """Largest integer zoom that fits the X display (>= 1); used when --scale is 0."""
         w, h = size
         if w <= 0 or h <= 0:
             return 1
-        try:                                    # usable desktop, minus chrome
+        try:
             dw, dh = pygame.display.get_desktop_sizes()[0]
             dw, dh = int(dw * 0.9), int(dh * 0.9)
         except Exception:
@@ -344,12 +300,7 @@ class Monitor(object):
         return (size[0] * scale, size[1] * scale)
 
     def _ensure_window(self, pygame, size):
-        """Size the window to the card's mode.
-
-        Called when the mode changes or the zoom changes -- NOT per frame.
-        set_mode replaces the X window, so calling it on every present would
-        make the viewer unusable.
-        """
+        """Size the window to the card's mode; on mode or zoom change only (set_mode replaces the X window)."""
         want = self._window_for(pygame, size)
         if self.screen is not None and want == self.window:
             return
@@ -365,7 +316,6 @@ class Monitor(object):
             return
         surf = self.surface
         if self.window != self.mode:
-            # Nearest neighbour
             surf = pygame.transform.scale(surf, self.window)
         self.screen.blit(surf, (0, 0))
         pygame.display.flip()
@@ -373,7 +323,7 @@ class Monitor(object):
     def _blit(self, pygame, frame):
         self.surface = pygame.image.frombytes(frame_to_rgb(frame), frame.size,
                                               "RGB")
-        if frame.size != self.mode:                 # guest changed mode
+        if frame.size != self.mode:
             self.mode = frame.size
             self._ensure_window(pygame, self.mode)
         self.frames_shown += 1
@@ -388,7 +338,6 @@ class Monitor(object):
 
     def run(self):
         os.environ["DISPLAY"] = _resolve_display(os.environ.get("DISPLAY"))
-        # viewer only touches the display and event modules. 
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
         import pygame
 
@@ -401,7 +350,7 @@ class Monitor(object):
             clock = pygame.time.Clock()
             running = True
             last_idle_present = 0.0
-            IDLE_PRESENT_HZ = 4       # see the comment below _blit's call
+            IDLE_PRESENT_HZ = 4
             while running:
                 for ev in pygame.event.get():
                     if ev.type == pygame.QUIT:
@@ -412,7 +361,7 @@ class Monitor(object):
                         elif pygame.K_1 <= ev.key <= pygame.K_8:
                             self._rescale(pygame, ev.key - pygame.K_0)
                         elif ev.key == pygame.K_f:
-                            self._rescale(pygame, 0)      # 0 = fit
+                            self._rescale(pygame, 0)
 
                 try:
                     frame = self.live.read()
@@ -423,10 +372,8 @@ class Monitor(object):
                     self._present(pygame)
                     last_idle_present = time.time()
                 elif self.exit_when_gone and not os.path.exists(self.live.path):
-                    # The simulator exited and took its sink with it
                     running = False
                 elif time.time() - last_idle_present >= 1.0 / IDLE_PRESENT_HZ:
-                    # A demo can sit on one frame for the whole run
                     self._present(pygame)
                     last_idle_present = time.time()
 
@@ -476,8 +423,6 @@ def main(argv=None):
     return 0
 
 
-# -- NovaFbMonitorProcess (subprocess wrapper) -------------------------------
-
 class NovaFbMonitorProcess(object):
     def __init__(self, name="novafb_monitor", live_path=DEFAULT_LIVE_PATH,
                  scale=0, fps=60, title=None, wait=30.0, python=None,
@@ -488,11 +433,10 @@ class NovaFbMonitorProcess(object):
         self.fps = fps
         self.title = title
         self.wait = wait
-        # When set, test_terminate_all leaves the window up at the end of the
-        # run for the person watching to close.
+        # keep the window up after test_terminate_all
         self.keep_open = keep_open
         self.display = None
-        # The runner runs under its own venv
+        # runs under its own venv
         self.python = python or sys.executable or "python3"
         self.process = None
         self.pid = None
@@ -521,10 +465,7 @@ class NovaFbMonitorProcess(object):
             return os.environ.get("DISPLAY") or "(unset)"
 
     def start(self):
-        """Launch the viewer. Returns (ok, message).
-
-        Reports the import-time failures
-        """
+        """Launch the viewer -> (ok, message); reports import-time failures."""
         if not os.path.exists(MONITOR_PY):
             return False, f"novafbhelpers.py missing at {MONITOR_PY}"
         self.display = self._resolve_display()

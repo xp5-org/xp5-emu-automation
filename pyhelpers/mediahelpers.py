@@ -1,11 +1,4 @@
-"""Media, capture and artifact helpers, merged from four former siblings
-(gifhelpers.py, medialibhelpers.py, audiohelpers.py, artifacthelpers.py):
-GIF screen recording, the media library (whole removable-media files the
-user drops into images/), tone analysis of captured audio, and the disk
-artifact repository (frozen, injectable DOS directory trees). Independent
-features that happen to share one theme -- capturing and cataloguing test
-media -- kept in one file to cut down on near-empty modules.
-"""
+"""Media, capture and artifact helpers (merged from gifhelpers, medialibhelpers, audiohelpers, artifacthelpers): GIF screen recording, media library (images/), tone analysis of captured audio, disk artifact repository (injectable DOS directory trees)."""
 
 import json
 import math
@@ -23,9 +16,7 @@ import time
 from PIL import Image
 
 
-# =============================================================================
-# GIF screen recording -- merged from former gifhelpers.py
-# =============================================================================
+# GIF screen recording
 """
 gifhelpers.py
 -------------
@@ -52,8 +43,7 @@ finally called stop())
 """
 REPORTS_DIR = "/testrunnerapp/reports"
 
-# Consecutive failed grabs before giving up -- a stopped VM cannot come back,
-# and a recorder spinning on a dead monitor socket would hold the run open.
+# consecutive failed grabs before the recorder gives up
 _MAX_CONSECUTIVE_FAILURES = 3
 
 _ACTIVE = []
@@ -100,21 +90,24 @@ class GifRecorder:
 
         self.start_token = _progress_step()
         self.stepnum     = stepnum_of(self.start_token)
-        # Provisional -- keyed to the start step so early log messages have
-        # something to show. Renamed to the STOP step's number in _run() once
-        # the recording actually ends (see _finalize_gif_path), unless the
-        # caller pinned an explicit path.
+        # provisional name from the start step; renamed to the stop step in _run() unless a path was pinned
         self._gif_path_pinned = gif_path is not None
         self.gif_path    = gif_path or os.path.join(
             _reports_dir(), f"screenshot-{self.name}-{self.stepnum}.gif")
 
         self._frames   = []
         self._stop_evt = threading.Event()
+        # set while the run is SUSPENDED: take one frame, then wait; held time not counted toward max_seconds
+        self._hold_evt = threading.Event()
+        self._held_total = 0.0
         self._thread   = None
         self._done     = threading.Event()
-        self._tmp_png  = f"/tmp/_gifcap_{self.name}_{self.stepnum}.png"
+        # tempfile, not a literal /tmp (Windows)
+        self._tmp_png  = os.path.join(tempfile.gettempdir(),
+                                      f"_gifcap_{self.name}_{self.stepnum}.png")
+        self.last_error = ""
         self.stop_reason = None
-        self.result = None            # (ok, message) once written
+        self.result = None
 
 
     def start(self):
@@ -128,8 +121,7 @@ class GifRecorder:
         return self
 
     def stop(self, reason="stopped", timeout=20):
-        """Ask the thread to finish and wait for the GIF to be written.
-        """
+        """Ask the thread to finish and wait for the GIF to be written."""
         if self.stop_reason is None:
             self.stop_reason = reason
         self._stop_evt.set()
@@ -138,24 +130,31 @@ class GifRecorder:
         self._done.wait(timeout=2)
         return self.result or (False, f"[{self.name}] recorder produced no GIF")
 
+    def hold(self):
+        """Take at most one more frame, then stop capturing until release()."""
+        self._hold_evt.set()
+
+    def release(self):
+        self._hold_evt.clear()
+
+    @property
+    def held(self):
+        return self._hold_evt.is_set()
+
     @property
     def running(self):
         return self._thread is not None and self._thread.is_alive()
 
     def _grab(self):
-        """One frame, as a palettised PIL image, or None on failure.
-
-        Goes through the instance's own take_screenshot so every backend works
-        (QEMU monitor screendump, `import` on an X window, Basilisk); palettising
-        immediately keeps a long recording from holding hundreds of full RGB
-        frames in memory.
-        """
+        """One frame as a palettised PIL image, or None (via the instance's take_screenshot; palettised to save memory)."""
         try:
             result = self.instance.take_screenshot(filename=self._tmp_png)
-        except Exception:
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
             return None
         ok = result[0] if isinstance(result, tuple) else bool(result)
         if not ok or not os.path.exists(self._tmp_png):
+            self.last_error = str(result[1]) if isinstance(result, tuple) and len(result) > 1 else "screenshot failed"
             return None
         try:
             with Image.open(self._tmp_png) as img:
@@ -173,20 +172,15 @@ class GifRecorder:
             return self.stop_reason or "stopped"
         if self.max_frames and len(self._frames) >= self.max_frames:
             return f"max_frames={self.max_frames}"
-        if self.max_seconds and (time.time() - started_at) >= self.max_seconds:
+        if self.max_seconds and (time.time() - started_at - self._held_total) >= self.max_seconds:
             return f"max_seconds={self.max_seconds:g}"
-        # Safety net only: never outlive the run. "" means progress_state was
-        # unreadable -- keep recording rather than stopping on a transient
-        # import failure. Advancing to the NEXT step is deliberately not a stop
-        # condition; recording across the following steps is the whole point.
+        # safety net: stop when the run ends; "" = progress_state unreadable, keep recording
         if _progress_step() == "Idle":
             return "testlist ended"
         return None
 
     def _finalize_gif_path(self):
-        """Rename the pending GIF to the STOP step's number, not the start
-        step's . this is to prevent failed or aborted tests from orphaning captures
-        """
+        """Rename the pending GIF to the STOP step's number (failed/aborted tests don't orphan captures)."""
         if self._gif_path_pinned:
             return
         stop_stepnum = stepnum_of()
@@ -206,7 +200,8 @@ class GifRecorder:
                     failures += 1
                     if failures >= _MAX_CONSECUTIVE_FAILURES:
                         self.stop_reason = (self.stop_reason
-                                            or "capture failed (instance gone?)")
+                                            or "capture failed (instance gone?)"
+                                            + (f": {self.last_error}" if self.last_error else ""))
                         break
                 else:
                     failures = 0
@@ -216,7 +211,16 @@ class GifRecorder:
                 if reason:
                     self.stop_reason = reason
                     break
-                # Event-based sleep so stop() is not held up by the interval.
+                if self._hold_evt.is_set():
+                    held_at = time.time()
+                    while self._hold_evt.is_set() and not self._stop_evt.wait(0.25):
+                        pass
+                    self._held_total += time.time() - held_at
+                    if self._stop_evt.is_set():
+                        self.stop_reason = self.stop_reason or "stopped"
+                        break
+                    continue
+                # event-based sleep so stop() is not delayed
                 if self._stop_evt.wait(self.interval):
                     self.stop_reason = self.stop_reason or "stopped"
                     break
@@ -237,11 +241,7 @@ class GifRecorder:
             self._done.set()
 
     def _letterbox(self, frame, target_size):
-        """Center `frame` on a black `target_size` canvas if it's smaller.
-
-        A mode change mid-recording (e.g. 640x480 -> 800x600) means frames
-        of differing sizes. Padding every frame to the largest seen size to avoid truncating image data
-        """
+        """Center `frame` on a black `target_size` canvas if smaller (mode changes mid-recording)."""
         if frame.size == target_size:
             return frame
         canvas = Image.new("RGB", target_size, (0, 0, 0))
@@ -271,8 +271,7 @@ class GifRecorder:
                f"{elapsed:.1f}s (every {self.interval:g}s) -> {self.gif_path} "
                f"({size_kb:.0f} KB, {duration_ms}ms/frame). "
                f"Stopped: {self.stop_reason}.")
-        # Frames are only needed until the file exists; drop the references so
-        # a long recording does not sit in memory for the rest of the run.
+        # drop frame references once the file exists
         self._frames = []
         return True, msg
 
@@ -345,15 +344,14 @@ def init_db():
 
 
 def _classify(path, size):
-    """Derive a media kind from extension + size. .img/.dsk are ambiguous, so
-    fall back to the 2.88MB standard-floppy ceiling to split floppy from hdd."""
+    """Media kind from extension + size; .img/.dsk split floppy vs hdd at the 2.88MB ceiling."""
     ext = os.path.splitext(path)[1].lower()
     if ext in _ISO_EXTS:
         return "iso"
     if ext in (".qcow2", ".qcow"):
-        return "hdd"                       # qcow2 is never a floppy
+        return "hdd"
     if ext in (".vfd", ".flp", ".ima"):
-        return "floppy"                    # floppy-only containers
+        return "floppy"
     return "floppy" if size and size <= _MAX_FLOPPY_BYTES else "hdd"
 
 
@@ -364,18 +362,13 @@ def _row_to_dict(r):
     d["filename"] = os.path.basename(d["rel_path"])
     d["subdir"] = os.path.dirname(d["rel_path"])
     d["missing"] = not os.path.isfile(d["abs_path"])
-    # A floppy is copied per project; everything else is referenced in place.
+    # floppies are copied per project; others are referenced in place
     d["exportable"] = d["kind"] == "floppy"
     return d
 
 
 def scan_media():
-    """Walk IMAGES_ROOT and reconcile the index with what's on disk.
-
-    New files are inserted with a derived kind and no annotation
-
-    Returns (ok, message).
-    """
+    """Walk IMAGES_ROOT and reconcile the index with disk; new files get a derived kind and no annotation -> (ok, message)."""
     os.makedirs(IMAGES_ROOT, exist_ok=True)
     init_db()
     conn = _connect()
@@ -429,9 +422,7 @@ def scan_media():
 
 
 def list_media(kind=None, include_missing=True):
-    """Return every indexed item, optionally
-    filtered to one kind. Missing items are included by default so the UI can
-    show them greyed rather than silently dropping the notes."""
+    """All indexed items, optionally one kind; missing items included by default."""
     init_db()
     conn = _connect()
     rows = conn.execute("SELECT * FROM media_item ORDER BY rel_path").fetchall()
@@ -453,8 +444,7 @@ def get_media(item_id):
 
 
 def update_media(item_id, shortname=None, description=None, kind=None):
-    """Annotate an indexed item. Only the fields passed are touched. `kind` sets the override
-      pass "" to drop back to the derived kind."""
+    """Annotate an indexed item; only passed fields change. `kind` sets the override; "" restores the derived kind."""
     init_db()
     if not get_media(item_id):
         return False, f"media item {item_id} not found"
@@ -481,12 +471,7 @@ def update_media(item_id, shortname=None, description=None, kind=None):
 
 
 def forget_media(item_id):
-    """Drop an index row for good, along with its annotation.
-
-    Only for items whose file is already gone
-     
-    Returns (ok, message).
-    """
+    """Drop an index row and its annotation (for items whose file is gone) -> (ok, message)."""
     item = get_media(item_id)
     if not item:
         return False, f"media item {item_id} not found"
@@ -502,13 +487,7 @@ def forget_media(item_id):
 
 
 def export_media(item_id, dest_dir, dest_name=None, overwrite=False):
-    """Copy a floppy image out of the library into a project dir, so a testlist's
-    floppy1_img can point at its own mutable copy.
-
-    Refuses to clobber an existing file unless overwrite is set
-    
-    Returns (ok, message).
-    """
+    """Copy a floppy image from the library into a project dir (testlist floppy1_img). Refuses to overwrite unless overwrite is set -> (ok, message)."""
     item = get_media(item_id)
     if not item:
         return False, f"media item {item_id} not found"
@@ -537,15 +516,7 @@ def export_media(item_id, dest_dir, dest_name=None, overwrite=False):
 
 
 def config_path(item_id):
-    """The absolute path a testlist CONFIG should use to reference an in-place
-    (read-only) item — ISOs and prebuilt hard-disk images.
-
-    QEMU opens a cdrom read-only
-    two instances sharing one ISO file is ok
-    don't dont use this for hdd
-    
-    Returns (ok, path|message).
-    """
+    """Absolute path a CONFIG should use for an in-place read-only item (ISOs, prebuilt hard-disk images; not for hdd use) -> (ok, path|message)."""
     item = get_media(item_id)
     if not item:
         return False, f"media item {item_id} not found"
@@ -554,9 +525,7 @@ def config_path(item_id):
     return True, item["abs_path"]
 
 
-# =============================================================================
-# Audio tone analysis -- merged from former audiohelpers.py
-# =============================================================================
+# Audio tone analysis
 """Tone analysis for audio captured out of a QEMU guest.
 
 The pipeline this supports: QEMU's `wav` audiodev writes the emulated sound
@@ -564,9 +533,7 @@ card's mixed output straight to a .wav file on the host, and these helpers then
 answer "did the guest actually play the tone it was supposed to?".
 """
 def read_wav(path):
-    """Parse a PCM .wav into (samples, rate) with samples as mono floats in -1..1.
-
-    """
+    """PCM .wav -> (samples, rate); samples mono floats in -1..1."""
     if not os.path.isfile(path):
         return None, f"No audio capture at {path} (did the guest never open the sound card?)"
 
@@ -592,14 +559,14 @@ def read_wav(path):
                 return None, f"{path}: truncated fmt chunk"
             fmt = struct.unpack("<HHIIHH", data[body:body + 16])
         elif cid == b"data":
-            # The unfinalized-header case: trust the file, not the size field.
+            # unfinalized header: trust the file, not the size field
             avail = len(data) - body
             if csize == 0 or csize > avail:
                 csize = avail
             pcm = data[body:body + csize]
             break
 
-        pos = body + csize + (csize & 1)  # chunks are word-aligned
+        pos = body + csize + (csize & 1)
 
     if fmt is None:
         return None, f"{path}: no fmt chunk"
@@ -614,7 +581,7 @@ def read_wav(path):
         return None, f"{path}: bogus channel count {channels}"
 
     if bits == 8:
-        # 8-bit wav is unsigned, everything wider is signed.
+        # 8-bit wav is unsigned, wider is signed
         frames = [(b - 128) / 128.0 for b in pcm]
     elif bits == 16:
         count = len(pcm) // 2
@@ -623,7 +590,7 @@ def read_wav(path):
         return None, f"{path}: unsupported sample width {bits} bits"
 
     if channels > 1:
-        # Downmix: a tone is a tone regardless of which side QEMU panned it to.
+        # downmix to mono
         usable = len(frames) - (len(frames) % channels)
         frames = [sum(frames[i:i + channels]) / channels
                   for i in range(0, usable, channels)]
@@ -635,10 +602,7 @@ def read_wav(path):
 
 
 def goertzel_power(samples, rate, freq):
-    """Normalized power of `freq` within `samples`.
-
-    Generalized Goertzel
-    """
+    """Normalized generalized-Goertzel power of `freq` within `samples`."""
     n = len(samples)
     if n == 0:
         return 0.0
@@ -661,14 +625,12 @@ def rms(samples):
 
 
 def loudest_window(samples, rate, seconds=0.5):
-    """Return the `seconds`-long slice with the most energy.
-    """
+    """The `seconds`-long slice with the most energy."""
     width = int(rate * seconds)
     if width <= 0 or len(samples) <= width:
         return samples, 0.0
 
-    # Coarse hop — sample-by-sample would be pointless precision for "where is
-    # the loud bit", and this keeps a long capture cheap to scan.
+    # coarse hop for scanning
     hop = max(1, width // 8)
     best_start = 0
     best_energy = -1.0
@@ -682,13 +644,8 @@ def loudest_window(samples, rate, seconds=0.5):
 
 
 def find_peak_freq(samples, rate, lo_hz=100, hi_hz=8000, step_hz=None):
-    """Coarsely sweep Goertzel across a band and return (peak_hz, peak_power).
-
-    Answers "what tone is actually there", which is what makes a mismatch
-    diagnosable: reporting "expected 1000 Hz, found 2000 Hz" points at a sample
-    rate bug, where a bare "no tone" would not.
-    """
-    hi_hz = min(hi_hz, rate / 2.0)  # nothing above Nyquist is real
+    """Coarse Goertzel sweep over a band -> (peak_hz, peak_power)."""
+    hi_hz = min(hi_hz, rate / 2.0)
     if step_hz is None:
         bin_hz = rate / max(1, len(samples))
         step_hz = max(1.0, bin_hz / 3.0)
@@ -706,16 +663,7 @@ def find_peak_freq(samples, rate, lo_hz=100, hi_hz=8000, step_hz=None):
 
 def detect_tone(path, expect_hz, tolerance_hz=60.0, min_snr_db=10.0,
                 window_seconds=0.5, silence_rms=0.005):
-    """Check that `path` contains a tone at `expect_hz`.
-
-    Three things have to hold, because any one alone is forgeable: the capture
-    must not be silence, the strongest frequency present must be within
-    `tolerance_hz` of what we asked the guest to play, and that tone must stand
-    `min_snr_db` above the rest of the band (so broadband noise or a DC offset
-    cannot pass as a tone).
-
-    Returns (ok, message, details_dict).
-    """
+    """Check `path` contains a tone at `expect_hz`: not silence, strongest frequency within `tolerance_hz`, and `min_snr_db` above the rest of the band -> (ok, message, details_dict)."""
     expect_hz = float(expect_hz)
     tolerance_hz = float(tolerance_hz)
     min_snr_db = float(min_snr_db)
@@ -743,8 +691,7 @@ def detect_tone(path, expect_hz, tolerance_hz=60.0, min_snr_db=10.0,
                        f"never played anything."), details
 
     peak_hz, peak_power = find_peak_freq(window, rate)
-    # Doubled because a real-valued signal splits a tone's energy between the
-    # +f and -f bins and Goertzel only sees one of them.
+    # x2: a real signal splits tone energy between the +f and -f bins
     want_power = 2.0 * goertzel_power(window, rate, expect_hz)
 
     total_power = level * level
@@ -775,15 +722,7 @@ def detect_tone(path, expect_hz, tolerance_hz=60.0, min_snr_db=10.0,
 
 def detect_tone_sequence(path, expect_hz_list, tolerance_hz=60.0, min_snr_db=10.0,
                          window_seconds=0.4, hop_seconds=0.2, silence_rms=0.005):
-    """Check that `path` contains ALL of expect_hz_list at some point, each as
-    a tone
-
-    For each candidate frequency, slides a window across the capture and
-    keeps the window where that frequency has the best SNR agains
-
-    Returns (ok, message, details_dict) where details_dict["tones"] maps each
-    expected Hz to its own best-window result.
-    """
+    """Check `path` contains ALL of expect_hz_list as tones (best-SNR window per frequency) -> (ok, message, details_dict); details_dict["tones"] = {expected Hz: best-window result}."""
     expect_hz_list = [float(h) for h in expect_hz_list]
     tolerance_hz = float(tolerance_hz)
     min_snr_db = float(min_snr_db)
@@ -813,8 +752,7 @@ def detect_tone_sequence(path, expect_hz_list, tolerance_hz=60.0, min_snr_db=10.
         powers = {hz: 2.0 * goertzel_power(window, rate, hz) for hz in expect_hz_list}
         for hz in expect_hz_list:
             want_power = powers[hz]
-            # Residual against the OTHER candidates only, not the whole
-            # spectrum -- see docstring for why.
+            # residual against the other candidates only (see docstring)
             other_power = sum(p for h, p in powers.items() if h != hz)
             residual = max(other_power, total_power - want_power, 1e-12)
             snr_db = 10.0 * math.log10(max(want_power, 1e-12) / residual)
@@ -863,13 +801,11 @@ All disk I/O goes through mtools. The build disk is a
 partitioned FAT with the partition at byte offset 32256 (sector 63), matching
 qemuhelpers.copy_to_fat_image.
 """
-# Captured artifacts are test CONTENT, not engine code — they live under the
-# test root (/testsrc), NOT under pyhelpers/ (the core framework).
+# captured artifacts live under the test root (/testsrc), not pyhelpers/
 ARTIFACT_DIR = os.path.join(_TESTSRC_ROOT, "disk_artifacts")
 DEFAULT_OFFSET = 32256
 
-# v2 tarball layout: the captured dir tree lives under tree/, and any root DOS
-# boot config files captured alongside it
+# v2 tarball layout: captured tree under tree/, root DOS boot config files under boot/
 _TREE_SUBDIR = "tree"
 _BOOT_SUBDIR = "boot"
 _ROOT_BOOTFILES = ("CONFIG.SYS", "AUTOEXEC.BAT")
@@ -889,18 +825,15 @@ def _tarball_path(name):
 
 
 def _detect_offset(img_path):
-    """Return the byte offset of the FAT filesystem in a disk image: the first
-    partition's start (LBA*512) if the image has an MBR partition table, else 0
-    (an unpartitioned floppy). Lets the artifact ops work on both hdd and floppy
-    images without the caller knowing which it is."""
+    """Byte offset of the FAT filesystem in a disk image: first partition start (LBA*512) if MBR, else 0 (unpartitioned floppy)."""
     try:
         with open(img_path, "rb") as f:
             f.seek(0x1FE)
             if f.read(2) != b"\x55\xAA":
-                return 0  # no boot signature → treat as unpartitioned
-            f.seek(0x1C2)                      # partition 1 type byte
+                return 0
+            f.seek(0x1C2)
             ptype = f.read(1)[0]
-            f.seek(0x1C6)                      # partition 1 start LBA
+            f.seek(0x1C6)
             start_lba = int.from_bytes(f.read(4), "little")
             if ptype != 0 and start_lba != 0:
                 return start_lba * 512
@@ -917,10 +850,7 @@ def _mtoolsrc(img_path, drive="h", offset=DEFAULT_OFFSET):
 
 
 def _run(cmd, env=None):
-    """Run a shell command (bash), return (returncode, combined_output).
-
-    stdin=DEVNULL + start_new_session are both required
-    """
+    """Run a shell command (bash; stdin=DEVNULL + start_new_session) -> (returncode, combined_output)."""
     r = subprocess.run(cmd, shell=True, executable="/bin/bash", env=env,
                        stdin=subprocess.DEVNULL, start_new_session=True,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -928,8 +858,7 @@ def _run(cmd, env=None):
 
 
 def _is_qcow2(path):
-    """True if the file is a QCOW2 image (magic 'QFI\\xfb'). mtools can't read
-    QCOW2 — only raw — so these must be converted before/after mtools access."""
+    """True if the file is a QCOW2 image (mtools reads raw only)."""
     try:
         with open(path, "rb") as f:
             return f.read(4) == b"QFI\xfb"
@@ -938,12 +867,7 @@ def _is_qcow2(path):
 
 
 def _to_raw(img_path):
-    """If img_path is QCOW2, convert it to a temp raw image (next to the source,
-    for space/speed) and return (raw_path, True). 
-    Otherwise return (img_path, False).
-    
-    Callers MUST unlink the raw (when True) when done.
-    for writes call _commit_raw first to fold changes back into the QCOW2."""
+    """QCOW2 -> temp raw image next to the source -> (raw_path, True); else (img_path, False). Callers unlink the raw when True; for writes call _commit_raw first."""
     if not _is_qcow2(img_path):
         return img_path, False
     tmp = tempfile.NamedTemporaryFile(
@@ -977,11 +901,7 @@ def _dir_tarball_size(name):
 
 
 def list_artifacts():
-    """Return every artifact's manifest, augmented with tarball existence/size.
-
-    Sorted by name. Each entry is the stored manifest dict plus
-    `_tarball_exists` and `_tarball_size` (bytes).
-    """
+    """Every artifact's manifest plus `_tarball_exists` and `_tarball_size` (bytes), sorted by name."""
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
     out = []
     for fn in sorted(os.listdir(ARTIFACT_DIR)):
@@ -1012,17 +932,11 @@ def get_artifact(name):
 
 def capture_artifact(name, source_img, dos_dir, dest=None, description="",
                      offset=None, overwrite=False):
-    """Freeze a directory tree from a DOS disk image into a reusable artifact.
-
-    - name        : artifact id (slugified)
-    - source_img  : path to the disk image to read from
-    - dos_dir     : the directory ON the image to capture, relative to C:\\
-                    (e.g. "WATCOM" for C:\\WATCOM)
-    - dest        : DOS dir to inject into later (defaults to dos_dir)
-
-    Stores the tree's contents as <name>.tar.gz plus a <name>.json manifest.
-
-    Returns (success, message).
+    """Freeze a directory tree from a DOS disk image into an artifact (<name>.tar.gz + <name>.json manifest) -> (success, message).
+      name        artifact id (slugified)
+      source_img  disk image to read
+      dos_dir     directory on the image, relative to the C: root (e.g. "WATCOM")
+      dest        DOS dir to inject into later (default dos_dir)
     """
     name = _safe_name(name)
     if not name:
@@ -1039,7 +953,7 @@ def capture_artifact(name, source_img, dos_dir, dest=None, description="",
         return False, f"artifact '{name}' already exists (pass overwrite=True to replace)"
 
     try:
-        raw, is_qcow = _to_raw(source_img)   # mtools needs raw, not qcow2
+        raw, is_qcow = _to_raw(source_img)
     except RuntimeError as e:
         return False, str(e)
     if offset is None:
@@ -1052,21 +966,19 @@ def capture_artifact(name, source_img, dos_dir, dest=None, description="",
     os.makedirs(tree_stage)
     os.makedirs(boot_stage)
     try:
-        # 1) Copy the tree's CONTENTS into tree/ (so inject can drop them back
-        # under any dest). mcopy -s recurses; -n/-o = no-confirm/overwrite.
+        # copy the tree's contents into tree/ (mcopy -s -n -o)
         rc, out = _run(f'mcopy -n -o -s h:/{dos_dir}/* "{tree_stage}"/', env=env)
-        # mcopy returns nonzero on an empty dir; treat "nothing copied" as an
-        # error only if the source dir genuinely isn't there.
+        # mcopy fails on an empty dir: error only if the source dir is missing
         if not os.listdir(tree_stage):
             rc_check, _ = _run(f'mdir h:/{dos_dir} >/dev/null 2>&1', env=env)
             if rc_check != 0:
                 return False, f"C:\\{dos_dir} not found on {os.path.basename(source_img)}:\n{out}"
 
-        # grab the root DOS boot config files
+        # root DOS boot config files
         bootfiles = []
         for bf in _ROOT_BOOTFILES:
             _run(f'mcopy -n -o "h:/{bf}" "{boot_stage}"/', env=env)
-            # mtools may write the 8.3 name in either case; normalize to upper.
+            # normalize 8.3 names to upper
             for got in os.listdir(boot_stage):
                 if got.upper() == bf and got != bf:
                     os.rename(os.path.join(boot_stage, got), os.path.join(boot_stage, bf))
@@ -1086,7 +998,7 @@ def capture_artifact(name, source_img, dos_dir, dest=None, description="",
             "description": description or "",
             "layout": "v2",
             "boot": False,
-            "bootfiles": bootfiles,          # root files this artifact carries
+            "bootfiles": bootfiles,
             "captured_from": os.path.basename(source_img),
             "captured_dos_dir": dos_dir,
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1112,14 +1024,7 @@ def capture_artifact(name, source_img, dos_dir, dest=None, description="",
 
 
 def inject_artifact(name, hdd_img_path, dest=None, offset=None, apply_bootfiles=False):
-    """Extract an artifact's tarball and copy it INTO a disk image at its DOS
-    dest dir. Works on a freshly created disk or an existing one (edit time) —
-    both are just an mcopy into the FAT partition.
-
-    If apply_bootfiles is true and the artifact carries root boot config
-    (CONFIG.SYS/AUTOEXEC.BAT), those are also written to C:\\ root, OVERWRITING
-    whatever is there
-    """
+    """Extract an artifact's tarball and mcopy it into a disk image at its DOS dest dir (fresh or existing disk). apply_bootfiles: also write the root boot config (CONFIG.SYS/AUTOEXEC.BAT), overwriting."""
     name = _safe_name(name)
     man = get_artifact(name)
     if not man:
@@ -1135,7 +1040,7 @@ def inject_artifact(name, hdd_img_path, dest=None, offset=None, apply_bootfiles=
         return False, "no dest dir (artifact manifest has no dest)"
 
     try:
-        raw, is_qcow = _to_raw(hdd_img_path)   # mtools needs raw, not qcow2
+        raw, is_qcow = _to_raw(hdd_img_path)
     except RuntimeError as e:
         return False, str(e)
     if offset is None:
@@ -1146,8 +1051,7 @@ def inject_artifact(name, hdd_img_path, dest=None, offset=None, apply_bootfiles=
     try:
         with tarfile.open(_tarball_path(name), "r:gz") as tf:
             tf.extractall(stage)
-        # v2 tarballs keep the tree under tree/ and boot files under boot/; v1
-        # (no "layout") kept the tree at the top level and had no boot files.
+        # v2: tree/ + boot/; v1 (no "layout"): tree at top level, no boot files
         if man.get("layout") == "v2":
             tree_dir = os.path.join(stage, _TREE_SUBDIR)
             boot_dir = os.path.join(stage, _BOOT_SUBDIR)
@@ -1155,7 +1059,7 @@ def inject_artifact(name, hdd_img_path, dest=None, offset=None, apply_bootfiles=
             tree_dir, boot_dir = stage, None
         if not os.path.isdir(tree_dir) or not os.listdir(tree_dir):
             return False, f"artifact '{name}' tarball is empty"
-        # Create the dest dir (ignore "already exists"), then copy contents in.
+        # create dest dir (ignore "already exists"), then copy contents in
         _run(f'mmd h:/{dest}', env=env)
         rc, out = _run(f'mcopy -n -o -s "{tree_dir}"/* h:/{dest}/', env=env)
         if rc != 0:
@@ -1176,7 +1080,7 @@ def inject_artifact(name, hdd_img_path, dest=None, offset=None, apply_bootfiles=
                 applied.append(bf)
 
         if is_qcow:
-            _commit_raw(raw, hdd_img_path)     # fold changes back into the qcow2
+            _commit_raw(raw, hdd_img_path)
         extra = f" (applied C:\\{', C:\\'.join(applied)})" if applied else ""
         return True, f"Injected artifact '{name}' → C:\\{dest} on {os.path.basename(hdd_img_path)}{extra}"
     finally:
@@ -1193,8 +1097,7 @@ def inject_artifact(name, hdd_img_path, dest=None, offset=None, apply_bootfiles=
 
 
 def remove_dir_from_disk(dest, hdd_img_path, offset=None):
-    """Delete a directory tree (e.g. an injected artifact's dest) off a disk
-    image. Returns (success, message)."""
+    """Delete a directory tree (e.g. an injected artifact's dest) off a disk image -> (success, message)."""
     hdd_img_path = os.path.abspath(str(hdd_img_path))
     if not os.path.isfile(hdd_img_path):
         return False, f"disk image not found: {hdd_img_path}"
@@ -1202,7 +1105,7 @@ def remove_dir_from_disk(dest, hdd_img_path, offset=None):
     if not dest:
         return False, "no dest dir to remove"
     try:
-        raw, is_qcow = _to_raw(hdd_img_path)   # mtools needs raw, not qcow2
+        raw, is_qcow = _to_raw(hdd_img_path)
     except RuntimeError as e:
         return False, str(e)
     if offset is None:
@@ -1214,7 +1117,7 @@ def remove_dir_from_disk(dest, hdd_img_path, offset=None):
         if rc != 0:
             return False, f"remove of C:\\{dest} failed (maybe not present):\n{out}"
         if is_qcow:
-            _commit_raw(raw, hdd_img_path)     # fold changes back into the qcow2
+            _commit_raw(raw, hdd_img_path)
         return True, f"Removed C:\\{dest} from {os.path.basename(hdd_img_path)}"
     finally:
         try:
@@ -1229,14 +1132,12 @@ def remove_dir_from_disk(dest, hdd_img_path, offset=None):
 
 
 def list_disk_toplevel(hdd_img_path, offset=None):
-    """Return the top-level directory names on a disk image's FAT partition, so
-    the UI can show what's currently stuffed into a disk. Returns (ok, list|msg).
-    """
+    """Top-level directory names on a disk image's FAT partition -> (ok, list|msg)."""
     hdd_img_path = os.path.abspath(str(hdd_img_path))
     if not os.path.isfile(hdd_img_path):
         return False, f"disk image not found: {hdd_img_path}"
     try:
-        raw, is_qcow = _to_raw(hdd_img_path)   # mtools needs raw, not qcow2
+        raw, is_qcow = _to_raw(hdd_img_path)
     except RuntimeError as e:
         return False, str(e)
     if offset is None:
@@ -1249,7 +1150,7 @@ def list_disk_toplevel(hdd_img_path, offset=None):
             return False, out
         dirs = []
         for line in out.splitlines():
-            # mtools lists dirs as: "NAME         <DIR>     date time"
+            # mtools dir line: "NAME         <DIR>     date time"
             m = re.match(r"^(\S.*?)\s+<DIR>", line)
             if m:
                 nm = m.group(1).strip()
