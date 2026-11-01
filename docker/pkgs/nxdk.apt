@@ -1,0 +1,5 @@
+# desc: nxdk, original Xbox homebrew SDK
+# nxdk: clang/lld/llvm for the cross compile; cmake+bison+flex for nxdk's own
+# bundled tools (extract-xiso via cmake, cxbe/others via flex/bison).
+clang lld llvm
+cmake bison flex

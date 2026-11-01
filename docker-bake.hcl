@@ -24,7 +24,7 @@ target "base" {
 
 target "comp" {
   name       = "comp-${c}"
-  matrix     = { c = ["qemu", "86box", "retro68", "basilisk", "watcom", "ps2sdk", "pcsx2", "nxdk", "xemu", "vice", "hatari", "linapple", "webtools", "kicad"] }
+  matrix     = { c = ["qemu", "86box", "retro68", "basilisk", "watcom", "ps2sdk", "pcsx2", "nxdk", "xemu", "vice", "hatari", "linapple", "webtools", "kicad", "gnuradio", "simh", "verilator", "dosbox", "eda"] }
   dockerfile = "docker/${c}.Dockerfile"
   context    = "."
   contexts   = { base = "target:base" }
@@ -51,7 +51,12 @@ target "final" {
     COMPONENTS == "all" || contains(split(",", COMPONENTS), "hatari") ? { ctx-hatari = "target:comp-hatari" } : {},
     COMPONENTS == "all" || contains(split(",", COMPONENTS), "linapple") ? { ctx-linapple = "target:comp-linapple" } : {},
     COMPONENTS == "all" || contains(split(",", COMPONENTS), "webtools") ? { ctx-webtools = "target:comp-webtools" } : {},
-    COMPONENTS == "all" || contains(split(",", COMPONENTS), "kicad") ? { ctx-kicad = "target:comp-kicad" } : {}
+    COMPONENTS == "all" || contains(split(",", COMPONENTS), "kicad") ? { ctx-kicad = "target:comp-kicad" } : {},
+    COMPONENTS == "all" || contains(split(",", COMPONENTS), "gnuradio") ? { ctx-gnuradio = "target:comp-gnuradio" } : {},
+    COMPONENTS == "all" || contains(split(",", COMPONENTS), "simh") ? { ctx-simh = "target:comp-simh" } : {},
+    COMPONENTS == "all" || contains(split(",", COMPONENTS), "verilator") ? { ctx-verilator = "target:comp-verilator" } : {},
+    COMPONENTS == "all" || contains(split(",", COMPONENTS), "dosbox") ? { ctx-dosbox = "target:comp-dosbox" } : {},
+    COMPONENTS == "all" || contains(split(",", COMPONENTS), "eda") ? { ctx-eda = "target:comp-eda" } : {}
   )
   args = { COMPONENTS = COMPONENTS, APT_PROXY = APT_PROXY }
   tags = [TAG]

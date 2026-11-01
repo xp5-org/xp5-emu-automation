@@ -1,0 +1,3 @@
+# desc: linapple-pie Apple II emulator
+# linapple-pie (Apple ][/][+/IIe emulator) build deps (CMake, SDL2 frontend)
+build-essential cmake git imagemagick libsdl2-dev libsdl2-image-dev libzip-dev libcurl4-openssl-dev zlib1g-dev libpulse-dev libasound2-dev

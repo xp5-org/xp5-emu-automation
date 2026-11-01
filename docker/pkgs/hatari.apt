@@ -1,0 +1,5 @@
+# desc: Hatari Atari ST emulator + m68k-atari-mintelf cross tools
+# Hatari (Atari ST emulator) build deps; its ./configure wrapper drives cmake
+cmake zlib1g-dev libsdl2-dev libpng-dev libreadline-dev
+# add-apt-repository, for the m68k-atari-mintelf PPA (see Dockerfile)
+software-properties-common

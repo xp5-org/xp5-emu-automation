@@ -1,0 +1,16 @@
+# desc: KiCad (kicad-cli + stock libraries), built from git
+# KiCad (built from git, docker/kicad.Dockerfile) and wxWidgets build deps. The
+# -dev packages double as the runtime libs for the overlay in the final image.
+# kicad-cli ships with the build; the distro kicad/kicad-symbols are NOT used.
+build-essential cmake ninja-build git curl bzip2 pkg-config gettext swig
+libgtk-3-dev libgl-dev libglu1-mesa-dev libglew-dev libglm-dev libegl-dev
+libwebkit2gtk-4.1-dev libsecret-1-dev libnotify-dev libsm-dev libtiff-dev
+libjpeg-dev libpng-dev libexpat1-dev
+libboost-dev libboost-filesystem-dev libboost-locale-dev libboost-system-dev
+libboost-iostreams-dev libboost-test-dev
+libcairo2-dev libcurl4-openssl-dev libssl-dev libgit2-dev libzstd-dev zlib1g-dev
+libharfbuzz-dev libfontconfig-dev libfreetype-dev libngspice0-dev
+libocct-modeling-algorithms-dev libocct-data-exchange-dev
+libocct-visualization-dev libocct-foundation-dev libocct-ocaf-dev
+libprotobuf-dev protobuf-compiler libnng-dev libpython3-dev libxml2-dev
+libxslt1-dev

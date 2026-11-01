@@ -1,0 +1,11 @@
+# desc: QEMU system emulators, built from source
+# QEMU build deps. QEMU itself is built from source (docker/qemu.Dockerfile);
+# these stay in the final image so testlists can build their own patched QEMU.
+libglib2.0-dev
+libfdt-dev
+libpixman-1-dev
+zlib1g-dev
+ninja-build
+libsdl2-dev
+libgtk-3-dev
+libslirp-dev

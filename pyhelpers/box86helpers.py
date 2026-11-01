@@ -680,6 +680,9 @@ class Box86Instance:
             return env
         env["DISPLAY"] = self.display
         env["86BOX_MANAGER_SOCKET"] = self._manager_sock_path
+        # cv2 (imported by the runner for OCR) points these at its bundled Qt 5.15.19 xcb plugin; 86Box links the system Qt, and mixing the two aborts at startup
+        for k in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR", "QT_PLUGIN_PATH"):
+            env.pop(k, None)
         return env
 
     def _accept_manager_connection(self):

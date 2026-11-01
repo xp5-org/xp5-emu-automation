@@ -1,0 +1,3 @@
+# desc: xemu original Xbox emulator (AppImage)
+# AppImage is self-contained (verified clean with ldd on the original image,
+# but only ever tested alongside the other components' libs).

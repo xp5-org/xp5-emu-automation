@@ -17,7 +17,7 @@
 #   COMPONENTS=86box,simh,watcom docker buildx bake
 #   docker buildx bake --print                  # show the resolved plan
 # Components: qemu simh dosbox 86box retro68 verilator eda basilisk watcom
-#             ps2sdk pcsx2 nxdk xemu vice hatari linapple webtools kicad
+#             ps2sdk pcsx2 nxdk xemu vice hatari linapple webtools kicad gnuradio
 # Defaults for unselected components; bake's named context ctx-<name> replaces
 # the matching stage for the selected ones.
 FROM scratch AS ctx-qemu
@@ -34,6 +34,11 @@ FROM scratch AS ctx-hatari
 FROM scratch AS ctx-linapple
 FROM scratch AS ctx-webtools
 FROM scratch AS ctx-kicad
+FROM scratch AS ctx-gnuradio
+FROM scratch AS ctx-simh
+FROM scratch AS ctx-verilator
+FROM scratch AS ctx-dosbox
+FROM scratch AS ctx-eda
 
 FROM base
 
@@ -56,7 +61,7 @@ RUN printf '%s\n' \
 # One apt layer for the union of the selected components' package lists.
 RUN --mount=type=bind,source=docker,target=/docker \
     set -eux; \
-    known="qemu simh dosbox 86box retro68 verilator eda basilisk watcom ps2sdk pcsx2 nxdk xemu vice hatari linapple webtools kicad"; \
+    known="qemu simh dosbox 86box retro68 verilator eda basilisk watcom ps2sdk pcsx2 nxdk xemu vice hatari linapple webtools kicad gnuradio"; \
     for c in $(echo "$COMPONENTS" | tr ',' ' '); do \
         case " all $known " in *" $c "*) ;; *) echo "unknown component: $c (known: $known)" >&2; exit 1 ;; esac; \
     done; \
@@ -94,6 +99,11 @@ COPY --from=ctx-hatari   / /
 COPY --from=ctx-linapple / /
 COPY --from=ctx-webtools / /
 COPY --from=ctx-kicad    / /
+COPY --from=ctx-gnuradio / /
+COPY --from=ctx-simh     / /
+COPY --from=ctx-verilator / /
+COPY --from=ctx-dosbox   / /
+COPY --from=ctx-eda      / /
 RUN ldconfig
 
 # Toolchain env, exported image-wide so a testlist's build.sh needs no

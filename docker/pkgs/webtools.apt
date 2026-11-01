@@ -1,0 +1,8 @@
+# desc: Firefox + Chromium with Selenium drivers
+# Runtime libs for Firefox and Chromium (Chrome for Testing); the browsers
+# themselves are unpacked under /opt by webtools.Dockerfile.
+unzip fonts-liberation xdg-utils
+libgtk-3-0t64 libdbus-glib-1-2 libx11-xcb1 libxtst6 libasound2t64
+libnss3 libgbm1 libxss1 libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64
+libcups2t64 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2
+libpango-1.0-0 libcairo2

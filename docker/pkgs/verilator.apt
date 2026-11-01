@@ -1,0 +1,5 @@
+# desc: Verilator Verilog/SystemVerilog simulator, built from git
+# Build deps for docker/verilator.Dockerfile (github.com/verilator/verilator).
+# g++ and make stay in the image: Verilator compiles its generated C++ at run time.
+build-essential git perl python3 autoconf flex bison help2man ccache
+libfl2 libfl-dev libgoogle-perftools-dev numactl perl-doc zlib1g-dev

@@ -9,6 +9,7 @@ import socket
 import subprocess
 import tempfile
 import signal
+import toolaudit
 import numpy as np
 import pexpect
 from PIL import Image
@@ -80,6 +81,7 @@ from dispatch_cc65 import *
 from dispatch_vice import *
 from dispatch_atari import *
 from dispatch_apple import *
+from dispatch_group import *
 
 def _next_window_slot(context):
     """Round-robin tile slot for this run's GUI windows, counted in the shared `context` (windowlayout.tile_position)."""
@@ -1068,7 +1070,17 @@ def test_hostbuild(command=None, cwd=None, timeout=600, name=None,
 
     name = name or config.get("function") or config.get("projdir") or "hostbuild"
 
+    # disk_artifacts/<tool> trees aren't in git; use where the image installed them
+    command = toolaudit.artifact_fallback(command)
+    tools = [] if IS_WINDOWS else toolaudit.audit_command(command)
     log = [f"$ {command}" + (f"   (cwd={cwd})" if cwd else "")]
+    if tools:
+        log.append("tools: " + ", ".join(f"{t['tool']}={t['path'] or 'MISSING'}" for t in tools))
+    missing = [] if IS_WINDOWS else toolaudit.missing_tools(command)  # MSYS bash has its own PATH
+    if missing:
+        context["abort"] = True
+        return False, "\n".join(log + [f"missing on this host: {', '.join(missing)} -- not in the container image; "
+                                       "add its component to the build (COMPONENTS=...) or install it"])
     timeout = int(timeout)
     fd, out_path = tempfile.mkstemp(prefix="test_hostbuild_", suffix=".log")
     os.close(fd)

@@ -1,0 +1,7 @@
+# desc: DOSBox-X DOS emulator, built from git
+# Build deps for docker/dosbox.Dockerfile (github.com/joncampbell123/dosbox-x); the
+# -dev packages double as the runtime libs.
+build-essential git autoconf automake libtool nasm pkg-config
+libncurses-dev libsdl2-dev libsdl2-net-dev libpng-dev zlib1g-dev libfreetype-dev
+libfluidsynth-dev libslirp-dev libpcap-dev libasound2-dev libxkbfile-dev libxrandr-dev
+libx11-dev libglu1-mesa-dev libavformat-dev libavcodec-dev libswscale-dev libavutil-dev

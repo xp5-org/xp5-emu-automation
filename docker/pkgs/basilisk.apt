@@ -1,0 +1,5 @@
+# desc: Basilisk II, classic 68k Macintosh emulator
+# Basilisk II (Unix/SDL+GTK) build deps; same dev packages as qemu.apt so the
+# two share one apt transaction when both are selected.
+libsdl2-dev
+libgtk-3-dev

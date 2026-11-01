@@ -1,0 +1,10 @@
+# desc: VICE Commodore emulators + cc65, xa, OpenCBM
+# cc65 C64/6502 toolchain, straight from apt (no need to build it)
+cc65
+# VICE (C64 emulator) + c1541 build deps, GTK3 native UI
+pkg-config ncurses-dev texinfo flex bison dos2unix file tar
+libgtk-3-dev libglew-dev libevdev-dev libpulse-dev libasound2-dev
+libsdl2-dev libcurl4-openssl-dev libreadline-dev libxaw7-dev libpng-dev
+libjpeg-dev libxrandr-dev libxinerama-dev libxi-dev
+# OpenCBM (real C64 drive access via XUM1541/ZoomFloppy)
+libusb-1.0-0-dev

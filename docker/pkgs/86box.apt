@@ -1,0 +1,18 @@
+# desc: 86Box PC emulator (AppImage)
+# patchelf'ing the 86Box AppImage's interpreter/rpath
+patchelf
+# Not for the AppImage itself: lets a testlist's test_hostbuild step
+# clone+build a patched 86Box fork. Matches 86Box's own CI package list
+# (.github/workflows/cmake_linux.yml, Qt5/Qt6/SDL legs) for Ubuntu.
+ninja-build libfreetype-dev libgles2-mesa-dev libsdl3-dev libpng-dev
+librtmidi-dev libopenal-dev libslirp-dev libfluidsynth-dev
+libvdeplug-dev libserialport-dev libzstd-dev
+qtbase5-dev qtbase5-private-dev qttools5-dev qttranslations5-l10n
+libevdev-dev libxkbcommon-x11-dev
+qt6-base-dev qt6-base-private-dev qt6-tools-dev qt6-tools-dev-tools
+qt6-l10n-tools qt6-translations-l10n libvulkan-dev
+# CI-check testlist (__testlist__86box_ci_prcheck_linux.py): BUILD_TESTING=ON
+# needs GTest; clang-format/cppcheck for style and static checks.
+libgtest-dev clang-format cppcheck
+# win10-kvm-isoprep testlist (win10_kvm_isoprep): extract+repack the Windows ISO.
+xorriso

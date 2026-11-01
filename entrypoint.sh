@@ -28,11 +28,14 @@ if [ ! -e /testsrc/m68k/BasiliskII ] && [ -x /usr/local/bin/BasiliskII ]; then
 fi
 
 # Set up users from command line input positions
-addgroup "$USERNAME"
-useradd -m -s /bin/bash -g "$USERNAME" "$USERNAME"
+# The default user ("user", uid 1001) and its ownership of /app and /opt/venv
+# are baked into the image (Dockerfile.base), so nothing here crawls trees.
+if ! id "$USERNAME" >/dev/null 2>&1; then
+  addgroup "$USERNAME"
+  useradd -m -s /bin/bash -g "$USERNAME" "$USERNAME"
+  usermod -aG sudo "$USERNAME"
+fi
 echo "$USERNAME:$USERPASSWORD" | chpasswd
-usermod -aG sudo "$USERNAME"
-echo "debug1"
 
 # SSH setup
 SSH_KEY_DIR="${SSH_KEY_DIR:-/keys}"
@@ -98,11 +101,7 @@ xfce4-terminal --hold --command="bash -c 'source /opt/venv/bin/activate && pytho
 EOF
 
 # Autostart the same command as an XFCE session app, so it launches the
-# moment the desktop session is created (by the priming login below, or by
-# a real user's first RDP login if priming is disabled/fails) instead of
-# requiring someone to double-click runme.sh by hand. This only fires once
-# per session *creation* -- a later RDP reconnect to the same still-running
-# session does not re-run autostart entries.
+# moment the desktop session is created 
 mkdir -p /home/$USERNAME/.config/autostart
 cat <<EOF > /home/$USERNAME/.config/autostart/testrunner.desktop
 [Desktop Entry]
@@ -129,20 +128,11 @@ xfce4-terminal --hold --command="tail -f $HOME/pipewire_output.log"
 EOF
 
 
-echo "debug2"
-chmod +x /home/$USERNAME/Desktop/runme.sh
-chmod +x /home/$USERNAME/Desktop/soundlog.sh
-chmod +x /home/$USERNAME/Desktop/sound_en.sh
-chmod +x /home/$USERNAME/Desktop/startaudio.sh
-echo "debug2.1"
-#sudo chown -R $USERNAME:user /opt/venv
-echo "debug2.2"
-sudo chown -R $USERNAME:user /app
-echo "debug2.3"
-sudo chown -R $USERNAME:user /testrunnerapp
-echo "debug2.4"
-sudo chown -R $USERNAME:user /home/user
-echo "debug3"
+chmod +x /home/$USERNAME/Desktop/runme.sh \
+         /home/$USERNAME/Desktop/soundlog.sh \
+         /home/$USERNAME/Desktop/sound_en.sh
+chown "$USERNAME:$USERNAME" /home/$USERNAME/Desktop /home/$USERNAME/Desktop/*.sh
+chown -R "$USERNAME:$USERNAME" /home/$USERNAME/.config
 
 # clear stale x session state
 echo "clearing stale session state from previous run..."
@@ -181,8 +171,8 @@ chown "$USERNAME":"$USERNAME" /tmp/.X11-unix/X10
 
 # Prime the RDP session: log in as $USERNAME against our own xrdp over
 # loopback and disconnect a few seconds later, so sesman creates the real
-# desktop session (and its autostart entry above launches the testrunner)
-# without waiting on a human to RDP in first. KillDisconnected defaults to
+# desktop session without waiting on a human to RDP in first. 
+# KillDisconnected defaults to
 # false in xrdp's sesman.ini, so the session this creates stays up after we
 # disconnect -- a real later RDP login as the same user reconnects to it.
 #
@@ -194,10 +184,10 @@ chown "$USERNAME":"$USERNAME" /tmp/.X11-unix/X10
     (exec 3<>/dev/tcp/127.0.0.1/3389) 2>/dev/null && exec 3>&- && break
     sleep 1
   done
-  # xvfb-run gives xfreerdp3 (an X11 client) a throwaway display to open its
+  # xvfb-run gives xfreerdp3 a throwaway display to open its
   # own window into -- this subshell has no DISPLAY of its own. `/sec` and
   # `/gfx` are left to auto-negotiate: forcing a specific value there is what
-  # broke this the first time ('/gfx:off' isn't valid syntax) and risks
+  # broke this the first time and risks
   # mismatching whatever security layer this xrdp build actually offers.
   timeout 8s xvfb-run -a xfreerdp3 /v:127.0.0.1 /port:3389 \
       /u:"$USERNAME" /p:"$USERPASSWORD" \
