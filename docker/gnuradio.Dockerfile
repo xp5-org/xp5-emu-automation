@@ -61,7 +61,5 @@ RUN set -eux; \
     find /usr/local/bin /opt/venv -newer /tmp/stamp \( -type f -o -type l \) -print0 | \
         xargs -0 cp -a --parents -t /out
 
-COPY docker-gnuradio-meshsdr/meshcore_sdr /out/data/meshcore_sdr
-
 FROM scratch
 COPY --from=build /out/ /

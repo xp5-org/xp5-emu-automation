@@ -19,4 +19,4 @@ RUN set -eux; \
 
 FROM scratch
 COPY --from=build /out/ /
-COPY --chmod=755 pcsx2.sh /usr/local/bin/pcsx2
+COPY --chmod=755 docker/scripts/pcsx2.sh /usr/local/bin/pcsx2

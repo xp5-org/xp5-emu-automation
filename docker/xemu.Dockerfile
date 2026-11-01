@@ -22,4 +22,4 @@ RUN set -eux; \
 
 FROM scratch
 COPY --from=build /out/ /
-COPY --chmod=755 xemu.sh /usr/local/bin/xemu
+COPY --chmod=755 docker/scripts/xemu.sh /usr/local/bin/xemu

@@ -27,4 +27,4 @@ RUN set -eux; \
 
 FROM scratch
 COPY --from=build /out/ /
-COPY --chmod=755 86box.sh /usr/local/bin/86box
+COPY --chmod=755 docker/scripts/86box.sh /usr/local/bin/86box
