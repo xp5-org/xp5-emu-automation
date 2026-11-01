@@ -9,31 +9,34 @@ variable "COMPONENTS" { default = "all" }
 variable "APT_PROXY" { default = "" }
 variable "QEMU_VERSION" { default = "latest" }
 variable "TAG" { default = "xp5-rdp-test:latest" }
+variable "BASE_ONLY" { default = false }  // true: build just the xrdp + audio base image (no components)
+variable "TEMPLATE_TAG" { default = "xp5-rdp-template:latest" }
+variable "SRC" { default = "." }  // build context: path to the testsrc checkout (set when not running from it)
 variable "BASE_TAG" { default = "xp5-rdp-testbase:latest" }
 
 group "default" {
-  targets = ["final"]
+  targets = BASE_ONLY ? ["base"] : ["final"]
 }
 
 target "base" {
   dockerfile = "Dockerfile.base"
-  context    = "."
-  args       = { APT_PROXY = APT_PROXY }
-  tags       = [BASE_TAG]
+  context    = SRC
+  args       = { APT_PROXY = APT_PROXY, LEAN = BASE_ONLY ? "1" : "0" }
+  tags       = [BASE_ONLY ? TEMPLATE_TAG : BASE_TAG]
 }
 
 target "comp" {
   name       = "comp-${c}"
   matrix     = { c = ["qemu", "86box", "retro68", "basilisk", "watcom", "ps2sdk", "pcsx2", "nxdk", "xemu", "vice", "hatari", "linapple", "webtools", "kicad", "gnuradio", "simh", "verilator", "dosbox", "eda"] }
   dockerfile = "docker/${c}.Dockerfile"
-  context    = "."
+  context    = SRC
   contexts   = { base = "target:base" }
   args       = c == "qemu" ? { APT_PROXY = APT_PROXY, QEMU_VERSION = QEMU_VERSION } : { APT_PROXY = APT_PROXY }
 }
 
 target "final" {
   dockerfile = "Dockerfile"
-  context    = "."
+  context    = SRC
   // ctx-<name> is only passed for selected components; for the rest the
   // Dockerfile's own `FROM scratch AS ctx-<name>` stage stays in place.
   contexts = merge(

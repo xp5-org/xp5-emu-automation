@@ -62,13 +62,6 @@ RUN apt-get update && \
         xterm \
         git \
         vim \
-        # generic screen-scraping/disk-image toolkit shared by every backend
-        # via pyhelpers/dispatch_functions.py + pyhelpers/mediahelpers.py
-        genisoimage \
-        tesseract-ocr \
-        mtools \
-        xdotool \
-        imagemagick \
         # for pipewire (RDP audio channel)
         pipewire \
         pipewire-pulse wireplumber \
@@ -84,14 +77,22 @@ RUN apt-get update && \
         pkg-config \
         libpipewire-0.3-dev \
         libspa-0.2-dev
+# Generic screen-scraping/disk-image toolkit shared by every backend via
+# pyhelpers/dispatch_functions.py + pyhelpers/mediahelpers.py, with its OCR
+# data and the testrunner's Python requirements. Skipped with LEAN=1 (bake:
+# BASE_ONLY=true) for a bare xrdp + audio desktop.
+ARG LEAN=0
+RUN if [ "$LEAN" != 1 ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            genisoimage tesseract-ocr mtools xdotool imagemagick && \
+        mkdir -p /usr/local/share/tessdata && \
+        curl -sL -o /usr/local/share/tessdata/eng.traineddata \
+            https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata; \
+    fi
 RUN apt-get remove -y light-locker xscreensaver
 RUN apt-get autoremove -y
 RUN rm -rf /var/cache/apt /var/lib/apt/lists/*
-
-# get the good tesseract ocr data
-RUN mkdir -p /usr/local/share/tessdata && \
-    curl -sL -o /usr/local/share/tessdata/eng.traineddata \
-        https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata
 
 # Fix XRDP/X11 setup
 RUN mkdir -p /var/run/dbus && \
@@ -108,7 +109,7 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install --upgrade pip && \
-    /opt/venv/bin/pip install -r /app/requirements.txt && \
+    if [ "$LEAN" != 1 ]; then /opt/venv/bin/pip install -r /app/requirements.txt; fi && \
     chgrp -R users /opt/venv && \
     chmod -R g+rwX /opt/venv && \
     find /opt/venv -type d -exec chmod g+s {} \;
