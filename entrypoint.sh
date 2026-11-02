@@ -95,13 +95,20 @@ echo "sshd started on port 22 (password auth + agent key both enabled for $USERN
 # ---- end SSH ----
 
 mkdir -p /home/$USERNAME/Desktop/
+# TESTRUNNER=0 gives the bare xrdp + audio desktop (no testrunner launcher or
+# autostart), for use of the base image as a plain template environment.
+if [ "${TESTRUNNER:-1}" != "0" ]; then
 cat <<EOF > /home/$USERNAME/Desktop/runme.sh
 #!/bin/bash
 xfce4-terminal --hold --command="bash -c 'source /opt/venv/bin/activate && python3 /testrunnerapp/app.py'"
 EOF
 
 # Autostart the same command as an XFCE session app, so it launches the
-# moment the desktop session is created 
+# moment the desktop session is created (by the priming login below, or by
+# a real user's first RDP login if priming is disabled/fails) instead of
+# requiring someone to double-click runme.sh by hand. This only fires once
+# per session *creation* -- a later RDP reconnect to the same still-running
+# session does not re-run autostart entries.
 mkdir -p /home/$USERNAME/.config/autostart
 cat <<EOF > /home/$USERNAME/.config/autostart/testrunner.desktop
 [Desktop Entry]
@@ -110,6 +117,7 @@ Name=Test Runner
 Exec=/home/$USERNAME/Desktop/runme.sh
 X-GNOME-Autostart-enabled=true
 EOF
+fi
 
 cat <<'EOF' > /home/$USERNAME/Desktop/sound_en.sh
 #!/bin/bash
@@ -128,9 +136,10 @@ xfce4-terminal --hold --command="tail -f $HOME/pipewire_output.log"
 EOF
 
 
-chmod +x /home/$USERNAME/Desktop/runme.sh \
-         /home/$USERNAME/Desktop/soundlog.sh \
+chmod +x /home/$USERNAME/Desktop/soundlog.sh \
          /home/$USERNAME/Desktop/sound_en.sh
+# Only the files created above as root; never recurse into /testrunnerapp
+# (NFS) or the image trees.
 chown "$USERNAME:$USERNAME" /home/$USERNAME/Desktop /home/$USERNAME/Desktop/*.sh
 chown -R "$USERNAME:$USERNAME" /home/$USERNAME/.config
 
@@ -171,8 +180,8 @@ chown "$USERNAME":"$USERNAME" /tmp/.X11-unix/X10
 
 # Prime the RDP session: log in as $USERNAME against our own xrdp over
 # loopback and disconnect a few seconds later, so sesman creates the real
-# desktop session without waiting on a human to RDP in first. 
-# KillDisconnected defaults to
+# desktop session (and its autostart entry above launches the testrunner)
+# without waiting on a human to RDP in first. KillDisconnected defaults to
 # false in xrdp's sesman.ini, so the session this creates stays up after we
 # disconnect -- a real later RDP login as the same user reconnects to it.
 #
@@ -184,10 +193,10 @@ chown "$USERNAME":"$USERNAME" /tmp/.X11-unix/X10
     (exec 3<>/dev/tcp/127.0.0.1/3389) 2>/dev/null && exec 3>&- && break
     sleep 1
   done
-  # xvfb-run gives xfreerdp3 a throwaway display to open its
+  # xvfb-run gives xfreerdp3 (an X11 client) a throwaway display to open its
   # own window into -- this subshell has no DISPLAY of its own. `/sec` and
   # `/gfx` are left to auto-negotiate: forcing a specific value there is what
-  # broke this the first time and risks
+  # broke this the first time ('/gfx:off' isn't valid syntax) and risks
   # mismatching whatever security layer this xrdp build actually offers.
   timeout 8s xvfb-run -a xfreerdp3 /v:127.0.0.1 /port:3389 \
       /u:"$USERNAME" /p:"$USERPASSWORD" \

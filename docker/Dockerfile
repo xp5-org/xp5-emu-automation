@@ -12,10 +12,10 @@
 # installed once.
 #
 # Build via bake (it wires the contexts):
-#   docker buildx bake                          # everything
-#   COMPONENTS=86box docker buildx bake         # 86Box only, no QEMU
-#   COMPONENTS=86box,simh,watcom docker buildx bake
-#   docker buildx bake --print                  # show the resolved plan
+#   docker buildx bake -f docker/docker-bake.hcl                          # everything
+#   COMPONENTS=86box docker buildx bake -f docker/docker-bake.hcl         # 86Box only, no QEMU
+#   COMPONENTS=86box,simh,watcom docker buildx bake -f docker/docker-bake.hcl
+#   docker buildx bake -f docker/docker-bake.hcl --print                  # show the resolved plan
 # Components: qemu simh dosbox 86box retro68 verilator eda basilisk watcom
 #             ps2sdk pcsx2 nxdk xemu vice hatari linapple webtools kicad gnuradio
 # Defaults for unselected components; bake's named context ctx-<name> replaces
@@ -69,7 +69,7 @@ RUN --mount=type=bind,source=docker,target=/docker \
     for c in $known; do \
         if has-component "$c" && [ -f "/docker/pkgs/$c.apt" ]; then lists="$lists /docker/pkgs/$c.apt"; fi; \
     done; \
-    /docker/apt-install.sh $lists; \
+    sh /docker/apt-install.sh $lists; \
     # so testlists can build their own patched QEMU (e.g. sb16_isapc_echo)
     if has-component qemu; then apt-get build-dep -y qemu-system-misc ninja || true; fi; \
     # m68k-atari-mintelf cross-tools (Atari ST/MiNT sources). The PPA publishes

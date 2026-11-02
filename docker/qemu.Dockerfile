@@ -5,7 +5,7 @@
 FROM base AS build
 ARG APT_PROXY=
 RUN --mount=type=bind,source=docker,target=/docker \
-    /docker/apt-install.sh /docker/pkgs/qemu.apt && \
+    sh /docker/apt-install.sh /docker/pkgs/qemu.apt && \
     (apt-get build-dep -y qemu-system-misc ninja || true) && \
     rm -rf /var/lib/apt/lists/*
 

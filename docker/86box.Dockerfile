@@ -6,7 +6,7 @@
 FROM base AS build
 ARG APT_PROXY=
 RUN --mount=type=bind,source=docker,target=/docker \
-    /docker/apt-install.sh /docker/pkgs/86box.apt && \
+    sh /docker/apt-install.sh /docker/pkgs/86box.apt && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /opt
 RUN set -eux; \

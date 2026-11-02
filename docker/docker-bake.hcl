@@ -1,6 +1,6 @@
 // Composes the base + selected components into the final image.
-//   docker buildx bake                      -> all components
-//   COMPONENTS=86box,simh docker buildx bake
+//   docker buildx bake -f docker/docker-bake.hcl                      -> all components
+//   COMPONENTS=86box,simh docker buildx bake -f docker/docker-bake.hcl   (run from the testsrc root)
 // Every component with a docker/<name>.Dockerfile is a bake target; only the
 // selected ones are wired into the final image, the rest are left as
 // empty `FROM scratch` stages in the Dockerfile, so unselected builds never run.
@@ -19,7 +19,7 @@ group "default" {
 }
 
 target "base" {
-  dockerfile = "Dockerfile.base"
+  dockerfile = "docker/Dockerfile.base"
   context    = SRC
   args       = { APT_PROXY = APT_PROXY, LEAN = BASE_ONLY ? "1" : "0" }
   tags       = [BASE_ONLY ? TEMPLATE_TAG : BASE_TAG]
@@ -35,7 +35,7 @@ target "comp" {
 }
 
 target "final" {
-  dockerfile = "Dockerfile"
+  dockerfile = "docker/Dockerfile"
   context    = SRC
   // ctx-<name> is only passed for selected components; for the rest the
   // Dockerfile's own `FROM scratch AS ctx-<name>` stage stays in place.

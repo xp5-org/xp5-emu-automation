@@ -1,18 +1,17 @@
 # syntax=docker/dockerfile:1
-# GNU Radio for the LoRa / Meshtastic / MeshCore SDR flowgraphs (the same stack as
-# docker-gnuradio-meshsdr/). gr-lora_sdr and gr-osmosdr are built into a conda env
+# GNU Radio for the LoRa / Meshtastic / MeshCore SDR flowgraphs. gr-lora_sdr and gr-osmosdr are built into a conda env
 # (/opt/conda/envs/gr310) on top of the conda GNU Radio; Ubuntu's own gnuradio
 # (pkgs/gnuradio.apt) has no lora_sdr blocks. The env is NOT put on PATH, so it
 # cannot shadow /opt/venv: gnuradio-companion and grcc get wrappers in
 # /usr/local/bin that activate gr310, and flowgraph scripts run with
 # /opt/conda/envs/gr310/bin/python. Decoder deps (pyzmq, meshtastic,
-# meshcoredecoder, ...) go into the shared /opt/venv. Not carried over from
-# docker-gnuradio-meshsdr/: the Meshtastic firmware checkout and platformio.
+# meshcoredecoder, ...) go into the shared /opt/venv. Not included: the
+# Meshtastic firmware checkout and platformio.
 FROM base AS build
 ARG APT_PROXY=
 SHELL ["/bin/bash", "-c"]
 RUN --mount=type=bind,source=docker,target=/docker \
-    /docker/apt-install.sh /docker/pkgs/gnuradio.apt && \
+    sh /docker/apt-install.sh /docker/pkgs/gnuradio.apt && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
 RUN set -eux; \
@@ -27,7 +26,7 @@ RUN set -eux; \
     /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main; \
     /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r; \
     /opt/conda/bin/conda env create -f /data/gr-lora_sdr/environment.yml -p /opt/conda/envs/gr310 -y; \
-    /opt/conda/envs/gr310/bin/pip install pillow; \
+    /opt/conda/envs/gr310/bin/pip install pillow six; \
     source /opt/conda/etc/profile.d/conda.sh; \
     conda activate gr310; \
     # gr-lora_sdr
@@ -36,7 +35,8 @@ RUN set -eux; \
     # gr-osmosdr, RTL-SDR only
     CC=/usr/bin/gcc CXX=/usr/bin/g++ PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-} \
     cmake -S /data/gr-osmosdr -B /data/gr-osmosdr/build \
-        -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DENABLE_DEFAULT=OFF -DENABLE_RTL=ON \
+        -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPYTHON_EXECUTABLE=$CONDA_PREFIX/bin/python3 \
+        -DENABLE_DEFAULT=OFF -DENABLE_RTL=ON \
         -DLIBRTLSDR_INCLUDE_DIR=/usr/include \
         -DLIBRTLSDR_LIBRARIES=/usr/lib/x86_64-linux-gnu/librtlsdr.so \
         -DCMAKE_CXX_FLAGS="-I/usr/include/libusb-1.0" && \

@@ -44,8 +44,12 @@ cd "$SHARED_FS_PATH"
 git clone https://github.com/xp5-org/flask-testrunner.git testrunnerapp
 git clone https://github.com/xp5-org/xp5-emu-automation.git testsrc
 ```
+### Building the Image
 
-### 1. Build the image
+## 0. List what is available
+here is the command to run against the git dirs to see what the current version has as buildable docker layers
+
+## 1. prep bakebuilder
 
 Run from `testsrc/`, the directory that holds `docker-bake.hcl`, `Dockerfile`, `Dockerfile.base` and `docker/` together (the build context). Needs Docker with buildx.
 
@@ -57,6 +61,8 @@ COMPONENTS=qemu,86box docker buildx bake --load
 
 The second line selects the `bakebuilder` builder if it already exists and creates it otherwise, so it is safe to re-run. The third line is one command: `COMPONENTS=...` is an environment variable for `docker buildx bake`, and `--load` is a `bake` flag. For everything, use `COMPONENTS=all docker buildx bake --load` (or just `docker buildx bake --load`).
 
+
+## 2. Copy the components in
 `COMPONENTS` is a comma-separated list (default `all`). One command lists everything that can be selected, with a one-line description. `stage` means the component has its own `docker/<name>.Dockerfile`, compiled (or downloaded prebuilt) during `docker build`; `apt` would mean distro packages only, and none are left:
 
 ```bash
@@ -69,7 +75,9 @@ Each component builds in its own stage and apt packages shared between component
 
 Bake's `target:` contexts need a `docker-container` builder (the default `docker` driver fails with `unsupported context source target`), which is what the `buildx create` line sets up. `--load` puts the finished image into the local Docker image store.
 
-### 2a. Run from the CLI
+
+### running built image
+## 1. once image is built, run docker image from CLI
 
 ```bash
 docker run -d --name testnode -p 3389:3389 -p 8080:8080 \
@@ -81,7 +89,7 @@ docker run -d --name testnode -p 3389:3389 -p 8080:8080 \
 
 RDP to `localhost:3389`, web UI at `http://localhost:8080`. If `USERPASSWORD` is omitted a random one is printed in `docker logs`. The `/testsrc` mount provides `sourcedir/` and `pyhelpers/`; without it the web UI starts but lists no tests. The container's entrypoint `chown`s `/testrunnerapp` recursively, so that mount must be writable.
 
-### 2b. Run with docker compose (five-node cluster)
+## 1. Alternative - use docker compose to manage multiple nodes
 
 Five identical containers that all bind-mount the same host paths, so they share the app code, the `cluster/` queue directory, the test sources and the SSH keys. Each node gets its own hostname plus its own RDP and web ports.
 

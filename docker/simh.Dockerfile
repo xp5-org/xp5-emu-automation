@@ -7,7 +7,7 @@ FROM base AS build
 ARG APT_PROXY=
 ARG SIMH_REF=master
 RUN --mount=type=bind,source=docker,target=/docker \
-    /docker/apt-install.sh /docker/pkgs/simh.apt && \
+    sh /docker/apt-install.sh /docker/pkgs/simh.apt && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
 RUN set -eux; \

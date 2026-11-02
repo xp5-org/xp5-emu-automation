@@ -4,5 +4,5 @@ pytesseract
 beautifulsoup4
 numpy
 vncdotool
-pygame
+pygame-ce
 pexpect

@@ -6,7 +6,7 @@
 FROM base AS build
 ARG APT_PROXY=
 RUN --mount=type=bind,source=docker,target=/docker \
-    /docker/apt-install.sh /docker/pkgs/webtools.apt && \
+    sh /docker/apt-install.sh /docker/pkgs/webtools.apt && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
 RUN set -eux; \

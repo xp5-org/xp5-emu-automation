@@ -11,7 +11,7 @@ ARG APT_PROXY=
 ARG KICAD_REF=master
 ARG WX_VERSION=3.2.8
 RUN --mount=type=bind,source=docker,target=/docker \
-    /docker/apt-install.sh /docker/pkgs/kicad.apt && \
+    sh /docker/apt-install.sh /docker/pkgs/kicad.apt && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
 RUN set -eux; \

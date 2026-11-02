@@ -12,9 +12,9 @@
 # every backend image shares this layer instead of re-installing/rebuilding
 # it from scratch.
 #
-# Build:   docker buildx bake base   (or: docker build -f Dockerfile.base -t xp5-rdp-testbase:latest .)
-# Components + final image: see Dockerfile / docker-bake.hcl.
-FROM ubuntu:25.04
+# Build:   docker buildx bake -f docker/docker-bake.hcl base   (or: docker build -f docker/Dockerfile.base -t xp5-rdp-testbase:latest .)
+# Components + final image: see docker/Dockerfile and docker/docker-bake.hcl.
+FROM ubuntu:26.04
 ENV TZ=UTC
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
@@ -125,9 +125,9 @@ RUN mkdir -p /app/pipewire-module && \
     make install && \
     ldconfig
 
-COPY startaudio.sh /app/
+COPY docker/scripts/startaudio.sh /app/
 RUN chmod +x /app/startaudio.sh
-COPY entrypoint.sh /app
+COPY docker/scripts/entrypoint.sh /app/
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 3389 8080 22
