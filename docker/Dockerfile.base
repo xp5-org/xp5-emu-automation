@@ -23,7 +23,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 ARG APT_PROXY=
 RUN [ -z "$APT_PROXY" ] || printf '%s\n' \
         "Acquire::http::Proxy \"$APT_PROXY\";" \
-        'Acquire::http::Pipeline-Depth "0";' \
+        'Acquire::http::Pipeline-Depth "0";' 'Acquire::Retries "3";' \
         > /etc/apt/apt.conf.d/01proxy
 # Pipeline-Depth 0 above disables apt's HTTP request pipelining, which
 # apt-cacher-ng (and many other caching proxies) does not handle reliably --

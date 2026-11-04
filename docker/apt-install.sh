@@ -11,7 +11,7 @@ pkgs=$(sed 's/#.*//' "$@" | tr -s ' \t\n' ' ' | tr ' ' '\n' | sort -u | tr '\n' 
 # apt-cacher-ng corrupting pipelined responses (see Dockerfile.base).
 if [ -n "${APT_PROXY:-}" ]; then
     printf '%s\n' "Acquire::http::Proxy \"$APT_PROXY\";" \
-        'Acquire::http::Pipeline-Depth "0";' > /etc/apt/apt.conf.d/01proxy
+        'Acquire::http::Pipeline-Depth "0";' 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/01proxy
 fi
 apt-get update
 # shellcheck disable=SC2086

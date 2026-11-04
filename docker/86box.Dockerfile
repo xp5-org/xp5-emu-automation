@@ -22,6 +22,31 @@ RUN set -eux; \
     patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
              --set-rpath '/opt/86box/lib/x86_64-linux-gnu:/opt/86box/usr/lib:/opt/86box/usr/lib/x86_64-linux-gnu' \
              /opt/86box/usr/local/bin/86Box && \
+    # The final image is `FROM scratch` -- it has NO system libs of its own,
+    # so anything upstream's AppImage packaging excluded on the assumption
+    # that "every Linux host has this" (e.g. libopenal.so.1, pulled in only
+    # as an optional/dlopen'd audio backend) is simply absent at runtime,
+    # and 86Box aborts before its window appears. ldd lies about this at
+    # build time too: it reports such libs "not found" against THIS
+    # container's loader, same as it would on any host, so the gap was easy
+    # to miss. Sweep every ELF file actually bundled, resolve each "not
+    # found" dependency from this build stage's own ldconfig cache (it has
+    # libopenal-dev's runtime lib from 86box.apt, see pkgs/86box.apt), vendor
+    # it into the bundle, and fail the build instead of a host months later
+    # if something still can't be resolved.
+    missing=$(find /opt/86box -type f \( -name '*.so*' -o -perm -u+x \) -exec sh -c \
+        'file -b "$1" | grep -q ELF' _ {} \; -print 2>/dev/null | \
+        xargs -r ldd 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u) && \
+    mkdir -p /opt/86box/lib/x86_64-linux-gnu && \
+    for lib in $missing; do \
+        src=$(ldconfig -p | awk -v l="$lib" '$1==l {print $NF; exit}'); \
+        if [ -z "$src" ]; then \
+            echo "FATAL: $lib not bundled in the AppImage and not available in the build image either" >&2; \
+            exit 1; \
+        fi; \
+        echo "vendoring $lib from $src (excluded from upstream AppImage)"; \
+        cp -n "$src" /opt/86box/lib/x86_64-linux-gnu/; \
+    done && \
     chmod -R a+rX /opt/86box && \
     mkdir -p /out/opt && cp -a /opt/86box /out/opt/
 

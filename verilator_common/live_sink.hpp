@@ -18,6 +18,7 @@ namespace livesink {
 constexpr uint32_t MAGIC = 0x42464C56;  // "VLFB" little-endian, see header comment above
 constexpr uint32_t VERSION = 1;
 constexpr uint32_t FMT_RGB1 = 1;  // 1 byte/pixel: bit2=R, bit1=G, bit0=B
+constexpr uint32_t FMT_RGB565 = 2;  // 2 bytes/pixel little-endian: R[15:11] G[10:5] B[4:0]
 
 constexpr size_t HDR_WORDS = 16;
 constexpr size_t HDR_BYTES = HDR_WORDS * 4;  // 64
